@@ -12,15 +12,15 @@ SUSFS (`v2.4.0`) loadable kernel module (`susfs_guard_lkm`) for arm64 Android GK
 
 ## Installation
 
-- **Managed LKM loader (e.g. FinaSU):** download `SusFS-LKM-by-uran-<version>-<kmi>.ko` for your kernel KMI and load it in the LKM manager. Module details show `SusFS LKM by uran (<version>)`, exact CI/release version tag, and author `uran`.
+- **Managed LKM loader (e.g. FinaSU):** download `SusFS-LKM-by-uran-<version>-<kmi>.ko` for your kernel KMI and load it in the LKM manager. Module details show `SusFS LKM by uran (<version>)`, version (`v2.4.0-r1` for releases or `v2.4.0-r1-<hash>` for CI), and author `uran`.
 - **KernelSU ZIP module:** download `SusFS-LKM-by-uran-<version>.zip` (or single-KMI ZIP), flash in KernelSU manager, and reboot. Early loading before module `post-fs-data` can be enabled with `/data/adb/modules/susfs_guard_lkm/early_load`.
 
 ## Building via GitHub Actions
 
 Run the single **Build SusFS LKM by uran** workflow:
 - **`kernel`**: `universal` (all 8 KMIs + ZIP) or a single KMI.
-- **`publish_release`**: create a GitHub Release with the `.zip` and all `.ko` files attached.
-- **`release_tag`**: optional custom release tag (defaults to `VERSION`).
+- **`publish_release`**: create a GitHub Release (`v2.4.0-rN`) with the `.zip` and all `.ko` files attached.
+- **`release_tag`**: optional custom release tag (e.g. `v2.4.0-r2` or `r2`; auto-increments `v2.4.0-rN` if empty).
 
 ## Upstream
 

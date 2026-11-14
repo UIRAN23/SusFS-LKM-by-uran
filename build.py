@@ -122,21 +122,42 @@ def resolve_version(publish_release=False, release_tag="", run_number=0):
     commit = subprocess.check_output(
         ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
     ).strip()
-    base = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
-    if not re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+", base):
-        raise ValueError(f"Invalid VERSION contents: {base!r}")
+    raw_base = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
+    base_match = re.fullmatch(r"(v[0-9]+\.[0-9]+\.[0-9]+)(?:-r[0-9]+)?", raw_base)
+    if not base_match:
+        raise ValueError(f"Invalid VERSION contents: {raw_base!r}")
+    base = base_match.group(1)
 
     short = commit[:7]
-    clean_tag = (release_tag or "").strip()
-    if clean_tag and not re.fullmatch(r"[A-Za-z0-9._-]+", clean_tag):
-        raise ValueError(f"Invalid release tag: {clean_tag!r}")
+    tags_raw = subprocess.check_output(
+        ["git", "tag", "-l", f"{base}-r*"], cwd=ROOT, text=True
+    )
+    revisions = []
+    rev_re = re.compile(rf"^{re.escape(base)}-r([0-9]+)")
+    for line in tags_raw.splitlines():
+        match = rev_re.match(line.strip())
+        if match:
+            revisions.append(int(match.group(1)))
+    max_r = max(revisions, default=0)
 
+    clean_tag = (release_tag or "").strip()
     if publish_release:
-        tag = clean_tag or base
-        version = f"{tag}-release-{short}"
+        if clean_tag:
+            if re.fullmatch(r"r[0-9]+(?:\.[0-9]+)*", clean_tag):
+                tag = f"{base}-{clean_tag}"
+            elif re.fullmatch(
+                r"v[0-9]+\.[0-9]+\.[0-9]+-r[0-9]+(?:\.[0-9]+)*(?:-[A-Za-z0-9._-]+)?",
+                clean_tag,
+            ):
+                tag = clean_tag
+            else:
+                raise ValueError(f"Invalid release tag: {clean_tag!r}")
+        else:
+            tag = f"{base}-r{max_r + 1}"
+        version = tag
     else:
-        tag = base
-        version = f"{base}-ci-{short}"
+        tag = f"{base}-r{max(max_r, 1)}"
+        version = f"{tag}-{short}"
 
     version_code = 20400 + int(run_number)
     return {
