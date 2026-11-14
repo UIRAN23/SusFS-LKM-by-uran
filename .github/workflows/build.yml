@@ -1,0 +1,185 @@
+name: Build SusFS LKM by uran
+run-name: "SusFS LKM by uran / ${{ inputs.kernel || 'universal' }}${{ inputs.publish_release && ' (release)' || '' }}"
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['**.md']
+  workflow_dispatch:
+    inputs:
+      kernel:
+        description: Universal ZIP or single KMI
+        type: choice
+        default: universal
+        options:
+          - universal
+          - android12-5.10
+          - android13-5.10
+          - android13-5.15
+          - android14-5.15
+          - android14-6.1
+          - android15-6.6
+          - android16-6.12
+          - android17-6.18
+      publish_release:
+        description: Publish GitHub Release
+        type: boolean
+        default: false
+      release_tag:
+        description: Custom release tag (optional, defaults to VERSION)
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  prepare:
+    name: Resolve version
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      commit: ${{ steps.meta.outputs.commit }}
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+      version_code: ${{ steps.meta.outputs.version_code }}
+      is_release: ${{ steps.meta.outputs.is_release }}
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v7
+      - name: Compute build metadata
+        id: meta
+        env:
+          PUBLISH_RELEASE: ${{ inputs.publish_release }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: python3 build.py --resolve
+
+  build-ko:
+    needs: prepare
+    name: Build ${{ matrix.kmi }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        kmi: ${{ fromJSON((inputs.kernel == 'universal' || inputs.kernel == '') && '["android12-5.10","android13-5.10","android13-5.15","android14-5.15","android14-6.1","android15-6.6","android16-6.12","android17-6.18"]' || format('["{0}"]', inputs.kernel)) }}
+    container:
+      image: ghcr.io/ylarod/ddk-min:${{ matrix.kmi }}-20260828
+      options: --privileged
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v7
+      - name: Compile .ko
+        env:
+          KMI: ${{ matrix.kmi }}
+          SOURCE_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -eu
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          test -f "$KDIR/Makefile"
+          make -C "$KDIR" M="$PWD/kernel" ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 \
+            SUSFS_BUILD_VERSION="$SOURCE_VERSION" modules -j"$(nproc)"
+          mkdir -p out/ko
+          cp "kernel/susfs_guard_lkm.ko" "out/ko/SusFS-LKM-by-uran-$SOURCE_VERSION-$KMI.ko"
+      - name: Verify CFI and .modinfo
+        env:
+          KMI: ${{ matrix.kmi }}
+          SOURCE_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -eu
+          ko="out/ko/SusFS-LKM-by-uran-$SOURCE_VERSION-$KMI.ko"
+          ALLOW="init_module,susfs_layers_down,susfs_tw_func,susfs_watch_freeing,hk_own_run,hk_write_run"
+          if command -v python3 >/dev/null 2>&1; then PY=python3; else PY=python; fi
+          "$PY" tools/cfi_sites.py --allow "$ALLOW" "$ko"
+          "$PY" build.py --verify-ko "$ko" --kmi "$KMI" --expected-version "$SOURCE_VERSION"
+      - name: Set up uploader
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - name: Get artifact client
+        run: npm install --prefix "$RUNNER_TEMP/artifact-client" --no-audit --no-fund --no-package-lock --ignore-scripts @actions/artifact@6.3.1
+      - name: Upload .ko artifact
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const fs = await import('node:fs');
+            const path = await import('node:path');
+            const {pathToFileURL} = await import('node:url');
+            const library = path.join(process.env.RUNNER_TEMP, 'artifact-client/node_modules/@actions/artifact/lib/artifact.js');
+            const {DefaultArtifactClient} = await import(pathToFileURL(library).href);
+            const client = new DefaultArtifactClient();
+            const root = path.resolve('out/ko');
+            for (const name of fs.readdirSync(root)) {
+              await client.uploadArtifact(name, [path.join(root, name)], root, {skipArchive: true});
+            }
+
+  package:
+    name: Package KernelSU ZIP
+    needs: [prepare, build-ko]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v7
+      - name: Compile loader (susfs_insmod)
+        run: |
+          set -eu
+          clang --target=aarch64-linux-gnu -O2 -nostdlib -static-pie \
+            -fno-stack-protector -fno-builtin -fuse-ld=lld -Wl,-e,_start \
+            -o /tmp/susfs_insmod tools/susfs_insmod.c
+      - name: Download .ko artifacts and create ZIP
+        id: pkg
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KERNEL: ${{ inputs.kernel || 'universal' }}
+          SOURCE_VERSION: ${{ needs.prepare.outputs.version }}
+          VERSION_CODE: ${{ needs.prepare.outputs.version_code }}
+        run: |
+          set -eu
+          python3 build.py --package \
+            --loader /tmp/susfs_insmod \
+            --ko-dir out/ko \
+            --download-run "$GITHUB_RUN_ID" \
+            --kernel "$KERNEL" \
+            --expected-version "$SOURCE_VERSION" \
+            --version-code "$VERSION_CODE" \
+            --output dist
+      - name: Set up uploader
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - name: Get artifact client
+        run: npm install --prefix "$RUNNER_TEMP/artifact-client" --no-audit --no-fund --no-package-lock --ignore-scripts @actions/artifact@6.3.1
+      - name: Upload ZIP artifact
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const path = await import('node:path');
+            const {pathToFileURL} = await import('node:url');
+            const library = path.join(process.env.RUNNER_TEMP, 'artifact-client/node_modules/@actions/artifact/lib/artifact.js');
+            const {DefaultArtifactClient} = await import(pathToFileURL(library).href);
+            const client = new DefaultArtifactClient();
+            const zipName = '${{ steps.pkg.outputs.zip_name }}';
+            const distDir = path.resolve('dist');
+            const {id} = await client.uploadArtifact(zipName, [path.join(distDir, zipName)], distDir, {skipArchive: true});
+            const url = `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}/artifacts/${id}`;
+            await core.summary.addRaw(`- Download ZIP: [${zipName}](${url})\n`).write();
+      - name: Publish GitHub Release
+        if: ${{ needs.prepare.outputs.is_release == 'true' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          target_commitish: ${{ needs.prepare.outputs.commit }}
+          name: SusFS LKM by uran ${{ needs.prepare.outputs.tag }}
+          generate_release_notes: true
+          files: dist/*
