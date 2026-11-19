@@ -259,6 +259,7 @@ static bool sus_mount_ida_ready(void)
  * the other optional symbols this LKM uses. */
 static void (*pfn_security_cred_getsecid)(const struct cred *cred, u32 *secid);
 static char *(*pfn_d_path)(const struct path *path, char *buf, int buflen);
+static char *(*pfn_dentry_path_raw)(const struct dentry *dentry, char *buf, int buflen);
 
 /* __nocfi on every function that reaches a resolved kernel symbol through a function
  * pointer: kCFI validates the type hash at such a call site and panics with
@@ -330,6 +331,30 @@ static __nocfi char *sus_mount_d_path(const struct path *path, char *buf, int bu
     if (!pfn_d_path)
         return ERR_PTR(-ENOSYS);
     return pfn_d_path(path, buf, buflen);
+}
+
+static __nocfi char *sus_mount_dentry_path_raw(const struct dentry *dentry, char *buf, int buflen)
+{
+    if (!pfn_dentry_path_raw)
+        return ERR_PTR(-ENOSYS);
+    return pfn_dentry_path_raw(dentry, buf, buflen);
+}
+
+static bool sus_mount_root_is_ours(struct mount *r, char *buf, int buflen, const char **matched)
+{
+    struct dentry *root = r->mnt.mnt_root;
+    char *rp;
+
+    if (!root || IS_ROOT(root) || !pfn_dentry_path_raw)
+        return false;
+    rp = sus_mount_dentry_path_raw(root, buf, buflen);
+    if (IS_ERR_OR_NULL(rp))
+        return false;
+    if (!sus_mount_prefix_match_root(rp))
+        return false;
+    if (matched)
+        *matched = rp;
+    return true;
 }
 
 /* Effective threshold: clamped on every read too, because the sysfs knob can be
@@ -737,7 +762,7 @@ static int sus_mount_newmnt_entry(struct kretprobe_instance *ri, struct pt_regs 
  * /data/adb.  @buf is the caller's, small on purpose - this runs from a kretprobe
  * handler, where a PATH_MAX stack buffer would be a stack overflow waiting to happen,
  * and the mountpoints this rule accepts are short (/data/adb/modules/<name>/mnt). */
-static bool sus_mount_should_record(struct mount *r, char *buf, int buflen, char **why)
+static bool sus_mount_should_record(struct mount *r, char *buf, int buflen, const char **why)
 {
     struct sus_mount_view view;
     struct path p;
@@ -749,19 +774,21 @@ static bool sus_mount_should_record(struct mount *r, char *buf, int buflen, char
     if (devname_ours) {
         *why = "devname";
     } else {
-        if (!pfn_d_path)
-            return false;
-        p.mnt = &r->mnt;
-        p.dentry = r->mnt.mnt_root;
-        dp = sus_mount_d_path(&p, buf, buflen);
-        if (IS_ERR_OR_NULL(dp)) {
-            atomic_inc(&n_newmnt_pathfail);
-            return false;
+        if (pfn_d_path) {
+            p.mnt = &r->mnt;
+            p.dentry = r->mnt.mnt_root;
+            dp = sus_mount_d_path(&p, buf, buflen);
+            if (IS_ERR_OR_NULL(dp)) {
+                atomic_inc(&n_newmnt_pathfail);
+            } else {
+                sus_mount_view_set_path(&view, dp, strlen(dp));
+                path_ours = sus_mount_path_is_ours(dp);
+                if (path_ours)
+                    *why = dp;
+            }
         }
-        sus_mount_view_set_path(&view, dp, strlen(dp));
-        path_ours = sus_mount_path_is_ours(dp);
-        if (path_ours)
-            *why = dp;
+        if (!path_ours && sus_mount_root_is_ours(r, buf, buflen, why))
+            path_ours = true;
     }
     sus_mount_view_set_prefix(&view, devname_ours || path_ours);
     if (sus_mount_record_decide(&view, devname_ours, path_ours) !=
@@ -775,7 +802,7 @@ static int sus_mount_newmnt_ret(struct kretprobe_instance *ri, struct pt_regs *r
     struct sus_mount_newmnt_state *st = (struct sus_mount_newmnt_state *)ri->data;
     struct mount *r = st->m;
     char buf[SUS_MOUNT_NEWMNT_PATH_MAX];
-    char *why = NULL;
+    const char *why = NULL;
 
     if (!susfs_ptr_plausible(r) || (long)regs_return_value(regs) != 0)
         return 0;			/* the attach failed: nothing was mounted */
@@ -1187,7 +1214,7 @@ static bool sus_mount_should_hide_show(struct vfsmount *mnt)
         sus_mount_idmap_drop((int)r->mnt_id);
         /* mount_dbg: say why - the id, s_dev, root dentry and source are exactly
          * what sus_mount_is_ours() compared. */
-        if (mount_dbg && atomic_inc_return(&n_dbg_logged) <= 40)
+        if (mount_dbg && (unsigned int)atomic_inc_return(&n_dbg_logged) <= 40u)
             SUSFS_LOGI("sus_mount: hook: NOT ours id=%d s_dev=%u root=%px devname=%s\n",
                     r->mnt_id, (unsigned int)r->mnt.mnt_sb->s_dev,
                     r->mnt.mnt_root, r->mnt_devname ? r->mnt_devname : "none");
@@ -1886,7 +1913,9 @@ static int sus_mount_scan_ns(struct mnt_namespace *ns, char *buf, unsigned long 
         {
             struct sus_mount_view view;
             bool devname_ours, path_ours = false;
+            const char *rp = NULL;
 
+            shown = NULL;
             sus_mount_view_from_mount(&view, r, SUS_MOUNT_CTX_SCAN);
             devname_ours = sus_mount_path_is_ours(r->mnt_devname);
             if (devname_ours) {
@@ -1895,7 +1924,8 @@ static int sus_mount_scan_ns(struct mnt_namespace *ns, char *buf, unsigned long 
             } else {
                 /* meta-overlayfs style: the source is /dev/block/loopNN, so only the
                  * mount point says /data/adb/... .  d_path() of {mnt, mnt_root} is the
-                 * mountpoint path show_mountinfo() prints. */
+                 * mountpoint path show_mountinfo() prints; for bind mounts off /data
+                 * (e.g. /adb/modules/... onto /apex/...), inspect mnt_root as well. */
                 mnt_path.mnt = &r->mnt;
                 mnt_path.dentry = r->mnt.mnt_root;
                 dp = sus_mount_d_path(&mnt_path, buf, PATH_MAX);
@@ -1908,14 +1938,19 @@ static int sus_mount_scan_ns(struct mnt_namespace *ns, char *buf, unsigned long 
                 }
                 if (IS_ERR_OR_NULL(dp)) {
                     n_dpath_err++;
-                    continue;
+                } else {
+                    n_dpath_ok++;
+                    sus_mount_view_set_path(&view, dp, strlen(dp));
+                    path_ours = sus_mount_path_is_ours(dp);
+                    if (path_ours)
+                        shown = dp;
                 }
-                n_dpath_ok++;
-                sus_mount_view_set_path(&view, dp, strlen(dp));
-                path_ours = sus_mount_path_is_ours(dp);
+                if (!path_ours && sus_mount_root_is_ours(r, buf, PATH_MAX, &rp)) {
+                    path_ours = true;
+                    shown = rp;
+                }
                 if (!path_ours)
                     continue;
-                shown = dp;
             }
             sus_mount_view_set_prefix(&view, devname_ours || path_ours);
             if (sus_mount_record_decide(&view, devname_ours, path_ours) !=
@@ -2062,6 +2097,7 @@ int susfs_sus_mount_init(void)
     pfn_security_cred_getsecid =
         (void *)find_kernel_symbol_exact("security_cred_getsecid");
     pfn_d_path = (void *)find_kernel_symbol_exact("d_path");
+    pfn_dentry_path_raw = (void *)find_kernel_symbol_exact("dentry_path_raw");
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
     void *loader_xa = (void *)&mnt_id_xa;
     void *loader_alloc = (void *)&__xa_alloc;
@@ -2128,6 +2164,8 @@ int susfs_sus_mount_init(void)
         pr_warn("sus_mount: security_cred_getsecid not found - no su-domain gating, KSU mounts will be hidden from EVERY process including su\n");
     if (!pfn_d_path)
         pr_warn("sus_mount: d_path not found - only mnt_devname is checked, meta-overlayfs style mounts will NOT be marked\n");
+    if (!pfn_dentry_path_raw)
+        pr_warn("sus_mount: dentry_path_raw not found - bind mounts from /data/adb onto other mountpoints are matched only by mountpoint\n");
     /* The id side must own real ids; each missing symbol is named explicitly and
      * only disables the marking (the hook itself can still be installed). */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)

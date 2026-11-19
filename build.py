@@ -29,6 +29,7 @@ MODULE_SCRIPTS = (
     "customize.sh",
     "early-dispatch.sh",
     "kmi.sh",
+    "late-load.sh",
     "load.sh",
     "post-fs-data.sh",
     "uninstall.sh",

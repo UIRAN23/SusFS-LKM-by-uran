@@ -91,9 +91,15 @@ static void susfs_ensure_ksu_helpers(void)
 {
 	if (READ_ONCE(ksu_helpers_resolved))
 		return;
-	fn_setup_selinux = (void *)find_kernel_symbol_exact_any("setup_selinux");
-	fn_is_current_ksu_domain = (void *)find_kernel_symbol_exact_any("susfs_is_current_ksu_domain");
-	WRITE_ONCE(ksu_helpers_resolved, true);
+	if (!fn_setup_selinux)
+		fn_setup_selinux = (void *)find_kernel_symbol_exact_any("setup_selinux");
+	if (!fn_is_current_ksu_domain) {
+		fn_is_current_ksu_domain = (void *)find_kernel_symbol_exact_any("susfs_is_current_ksu_domain");
+		if (!fn_is_current_ksu_domain)
+			fn_is_current_ksu_domain = (void *)find_kernel_symbol_exact_any("is_ksu_domain");
+	}
+	if (fn_setup_selinux && fn_is_current_ksu_domain)
+		WRITE_ONCE(ksu_helpers_resolved, true);
 }
 
 static bool susfs_is_valid_app_name(const char *app_name)
@@ -142,7 +148,7 @@ static __nocfi noinline struct cred *susfs_switch_to_ksu_domain(void)
 
 	commit_creds(cred);
 
-	if (fn_is_current_ksu_domain && !fn_is_current_ksu_domain()) {
+	if (fn_setup_selinux && fn_is_current_ksu_domain && !fn_is_current_ksu_domain()) {
 		SUSFS_LOGE("domain is not ksu, restoring the original creds\n");
 		commit_creds(orig_cred);
 		return NULL;

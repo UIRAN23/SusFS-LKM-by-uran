@@ -18,7 +18,7 @@ else
 fi
 set_perm_recursive "$MODPATH" 0 0 0755 0644
 set_perm "$MODPATH/bin/susfs_insmod" 0 0 0755
-for script in early-dispatch.sh load.sh post-fs-data.sh uninstall.sh; do
+for script in early-dispatch.sh late-load.sh load.sh post-fs-data.sh uninstall.sh; do
   set_perm "$MODPATH/$script" 0 0 0755
 done
 touch "$MODPATH/skip_mount"
