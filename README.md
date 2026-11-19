@@ -13,7 +13,7 @@ SUSFS (`v2.4.0`) loadable kernel module (`susfs_guard_lkm`) for arm64 Android GK
 ## Installation
 
 - **Managed LKM loader (e.g. FinaSU):** download `SusFS-LKM-by-uran-<version>-<kmi>.ko` for your kernel KMI and load it in the LKM manager. Module details show `SusFS LKM by uran (<version>)`, version (`v2.4.0-r1` for releases or `v2.4.0-r1-<hash>` for CI), and author `uran`.
-- **KernelSU ZIP module:** download `SusFS-LKM-by-uran-<version>.zip` (or single-KMI ZIP), flash in KernelSU manager, and reboot. Early loading before module `post-fs-data` can be enabled with `/data/adb/modules/susfs_guard_lkm/early_load`.
+- **KernelSU ZIP module:** download `SusFS-LKM-by-uran-<version>.zip` (or single-KMI ZIP), flash in KernelSU manager, and reboot. Early loading before module `post-fs-data` (via `/data/adb/post-fs-data.d/00-susfs-guard-lkm.sh` + `early_load`) is enabled by default, and can be disabled by creating `/data/adb/modules/susfs_guard_lkm/no_early_load`.
 
 ## Building via GitHub Actions
 

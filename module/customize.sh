@@ -11,7 +11,11 @@ HOOK=/data/adb/post-fs-data.d/00-susfs-guard-lkm.sh
 if { [ -e "$HOOK" ] || [ -L "$HOOK" ]; } && ! cmp -s "$HOOK" "$MODPATH/early-dispatch.sh"; then
   [ -f "$INSTALLED/early-dispatch.sh" ] && cmp -s "$HOOK" "$INSTALLED/early-dispatch.sh" || abort "- a different early dispatcher already exists at $HOOK."
 fi
-[ ! -f "$INSTALLED/early_load" ] || touch "$MODPATH/early_load" || abort "- cannot preserve early loading."
+if [ -f "$INSTALLED/no_early_load" ]; then
+  touch "$MODPATH/no_early_load" || abort "- cannot preserve early-loading opt-out."
+else
+  touch "$MODPATH/early_load" || abort "- cannot enable early loading."
+fi
 set_perm_recursive "$MODPATH" 0 0 0755 0644
 set_perm "$MODPATH/bin/susfs_insmod" 0 0 0755
 for script in early-dispatch.sh load.sh post-fs-data.sh uninstall.sh; do
@@ -34,4 +38,4 @@ ui_print "- SusFS LKM by uran (arm64)"
 ui_print "- KMI is selected by the boot loader, not by this installer"
 ui_print "- Loader only; no rules are applied"
 ui_print "- Reboot to load; will not stack on an already-present susfs"
-ui_print "- Optional early loading: create $INSTALLED/early_load, then reboot."
+ui_print "- Early loading (post-fs-data.d) enabled by default; create $INSTALLED/no_early_load to opt out."
