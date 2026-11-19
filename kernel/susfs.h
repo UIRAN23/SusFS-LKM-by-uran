@@ -164,8 +164,10 @@ bool susfs_supercall_kprobe_active(void);
 int susfs_priority_init(void);
 void susfs_priority_exit(void);
 void susfs_set_priority_uid_filter(void __user **user_info);
+void susfs_set_sus_path_uid_filter(void __user **user_info);
 void susfs_parse_priority_app_strings(void);
 bool susfs_is_priority_uid_filtered(uid_t uid);
+bool susfs_is_sus_path_uid_allowed(uid_t uid);
 bool susfs_priority_active(void);
 
 /* SELinux hide 2.4.0 (for FinaSU contract) */

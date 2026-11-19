@@ -23,6 +23,7 @@
 #include "symbol_resolver.h"	/* find_kernel_symbol_exact (kallsyms_op) */
 #include "susfs_kprobe.h"	/* susfs_kp_forget_addr: a probe struct must be usable twice */
 #include "susfs_hk.h"		/* HooKern inline hooks with kprobe fallback */
+#include "susfs_bti.h"		/* ARM64 landing pad encodings */
 #include "ksu_allow_gate.h"	/* the control-node gate is su's own */
 
 /* ---- hide_modules: filter other kernel modules out of /proc/modules ----
@@ -581,7 +582,11 @@ static bool hide_syms_iter_plausible(const struct kallsym_iter_local *it)
 	return strnlen(it->module_name, sizeof(it->module_name)) < sizeof(it->module_name);
 }
 
-typedef int (*hide_syms_show_fn)(struct seq_file *, void *);
+extern void susfs_hide_s_stub(void);
+extern void susfs_hide_m_stub(void);
+extern unsigned long susfs_hide_s_tramp;
+extern unsigned long susfs_hide_m_tramp;
+
 static struct hk_inline hide_s_hook;
 static struct hk_inline hide_m_hook;
 static bool hide_s_inline;
@@ -602,7 +607,7 @@ static bool hide_s_should_skip(struct seq_file *m)
 		/* A rejected caller proves neither state: on the by-name path it may be a shared s_show
 		 * body (hiding still on) or another s_show (hiding off); with the identity resolved it is
 		 * a real mirror drift.  Only the unload counters can settle it. */
-		if (atomic_inc_return(&hide_layout_bad) == 1) {
+		if ((unsigned int)atomic_inc_return(&hide_layout_bad) == 1u) {
 			if (kallsyms_op_target)
 				pr_err("susfs_hide_syms: kallsyms m->private is not a struct kallsym_iter - the mirror drifted; /proc/kallsyms is NOT being filtered\n");
 			else
@@ -627,14 +632,9 @@ static bool hide_s_should_skip(struct seq_file *m)
 	return false;
 }
 
-static __nocfi noinline int hide_syms_s_show_wrap(struct seq_file *m, void *p)
+int __nocfi hide_syms_s_show_decide(struct seq_file *m, void *p)
 {
-	hide_syms_show_fn orig;
-
-	if (hide_s_should_skip(m))
-		return 0;
-	orig = (hide_syms_show_fn)READ_ONCE(hide_s_hook.orig);
-	return orig ? orig(m, p) : 0;
+	return hide_s_should_skip(m) ? 1 : 0;
 }
 
 /* s_show(m, p): m is arg #1 (x0), read through the same accessor the m_show handler below uses
@@ -694,14 +694,9 @@ static bool hide_m_should_skip(struct seq_file *m, void *p)
 	return true;
 }
 
-static __nocfi noinline int hide_syms_m_show_wrap(struct seq_file *m, void *p)
+int __nocfi hide_syms_m_show_decide(struct seq_file *m, void *p)
 {
-	hide_syms_show_fn orig;
-
-	if (hide_m_should_skip(m, p))
-		return 0;
-	orig = (hide_syms_show_fn)READ_ONCE(hide_m_hook.orig);
-	return orig ? orig(m, p) : 0;
+	return hide_m_should_skip(m, p) ? 1 : 0;
 }
 
 static int hide_syms_m_show_pre(struct kprobe *kp, struct pt_regs *regs)
@@ -764,15 +759,18 @@ static int __nocfi noinline hide_syms_resolve_show(struct kprobe *kp,
 
 	target = show;
 	if (!ksu_symbol_is_start(show, symbol_name)) {
+		int pads;
 
 		pc = show;
-		if (copy_from_kernel_nofault(&insn, (void *)pc, sizeof(insn)))
-			return -EFAULT;
-		if (insn == 0xd503245f) {		/* bti c: the entry stub's landing pad */
-			pc += sizeof(insn);
+		for (pads = 0; pads < SUSFS_ARM64_LANDING_PAD_MAX; pads++) {
 			if (copy_from_kernel_nofault(&insn, (void *)pc, sizeof(insn)))
 				return -EFAULT;
+			if (!susfs_arm64_is_landing_pad(insn))
+				break;
+			pc += sizeof(insn);
 		}
+		if (pads == SUSFS_ARM64_LANDING_PAD_MAX)
+			return -EINVAL;
 		if ((insn & 0xfc000000) != 0x14000000)	/* not an unconditional branch: no jump to follow */
 			return -EINVAL;
 		target = pc + (long)((s32)(insn << 6) >> 4);
@@ -785,15 +783,28 @@ static int __nocfi noinline hide_syms_resolve_show(struct kprobe *kp,
 	if (body_out)
 		*body_out = target;
 
-	/* The indirect call that reaches this function is BTI-checked.  A kprobe
-	 * breakpoint placed on the first instruction would overwrite the `bti c`
-	 * landing pad and turn every seq_read() of the file into a BTI fault.
-	 * Keep the landing pad and probe the instruction after it. */
-	if (!copy_from_kernel_nofault(&insn, (void *)target, sizeof(insn)) &&
-	    insn == 0xd503245f) {
-		target += sizeof(insn);
-		SUSFS_LOGI("susfs_hide_syms: %s.show BTI landing pad kept, probing %px\n",
-				table_name, (void *)target);
+	/* The indirect call that reaches this function may be BTI-checked, and
+	 * a kprobe breakpoint placed on an entry pad (`bti*` / `paciasp` / `pacibsp`)
+	 * overwrites that landing pad and faults callers.  Skip up to
+	 * SUSFS_ARM64_LANDING_PAD_MAX pads and refuse if nothing but pads is found. */
+	{
+		unsigned long kprobe_target = target;
+		int skipped = 0;
+
+		while (skipped < SUSFS_ARM64_LANDING_PAD_MAX) {
+			if (copy_from_kernel_nofault(&insn, (void *)kprobe_target, sizeof(insn)))
+				return -EFAULT;
+			if (!susfs_arm64_is_landing_pad(insn))
+				break;
+			kprobe_target += sizeof(insn);
+			skipped++;
+		}
+		if (skipped == SUSFS_ARM64_LANDING_PAD_MAX)
+			return -EINVAL;
+		if (skipped)
+			SUSFS_LOGI("susfs_hide_syms: %s.show BTI/PAC landing pad kept (%d), probing %px\n",
+					table_name, skipped, (void *)kprobe_target);
+		target = kprobe_target;
 	}
 	kp->addr = (kprobe_opcode_t *)target;
 	*table_out = op;
@@ -836,8 +847,8 @@ int susfs_hide_syms_init(void)
 	rc = hide_syms_resolve_show(&kp_s_show, "kallsyms_op", "s_show",
 			&kallsyms_op_target, &s_body);
 	if (!rc && susfs_hk_ready()) {
-		rc = susfs_hk_inline_hook(&hide_s_hook, "s_show", s_body,
-					  "hide_syms_s_show_wrap", hide_syms_s_show_wrap);
+		rc = susfs_hk_inline_hook_stub(&hide_s_hook, "s_show", s_body,
+					       susfs_hide_s_stub, &susfs_hide_s_tramp);
 		if (!rc) {
 			susfs_kp_forget_addr(&kp_s_show);
 			hide_s_inline = true;
@@ -888,8 +899,8 @@ int susfs_hide_syms_init(void)
 				rc);
 	} else {
 		if (susfs_hk_ready()) {
-			rc = susfs_hk_inline_hook(&hide_m_hook, "m_show", m_body,
-						  "hide_syms_m_show_wrap", hide_syms_m_show_wrap);
+			rc = susfs_hk_inline_hook_stub(&hide_m_hook, "m_show", m_body,
+						       susfs_hide_m_stub, &susfs_hide_m_tramp);
 			if (!rc) {
 				susfs_kp_forget_addr(&kp_m_show);
 				m_show_inline = true;

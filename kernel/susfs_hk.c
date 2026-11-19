@@ -88,14 +88,17 @@ void susfs_hk_exit(void)
 	mutex_unlock(&susfs_hk_ctl_lock);
 }
 
-int susfs_hk_inline_hook(struct hk_inline *h,
-			 const char *sym_name, unsigned long target_addr,
-			 const char *wrap_name, void *wrap_fn)
+static int susfs_hk_inline_install(struct hk_inline *h,
+				   const char *sym_name, unsigned long target_addr,
+				   const char *wrap_name, void *fn,
+				   unsigned long *tramp_out)
 {
 	unsigned long flags;
 	int rc;
 
-	if (!h || !sym_name || !sym_name[0] || !wrap_name || !wrap_name[0] || !wrap_fn)
+	if (!h || !sym_name || !sym_name[0] || !fn)
+		return -EINVAL;
+	if (!tramp_out && (!wrap_name || !wrap_name[0]))
 		return -EINVAL;
 
 	mutex_lock(&susfs_hk_ctl_lock);
@@ -111,8 +114,13 @@ int susfs_hk_inline_hook(struct hk_inline *h,
 	memset(h, 0, sizeof(*h));
 
 	spin_lock_irqsave(&susfs_hk_sym_lock, flags);
-	strscpy(cur_wrap_name, wrap_name, sizeof(cur_wrap_name));
-	cur_wrap_addr = (unsigned long)wrap_fn;
+	if (!tramp_out) {
+		strscpy(cur_wrap_name, wrap_name, sizeof(cur_wrap_name));
+		cur_wrap_addr = (unsigned long)fn;
+	} else {
+		cur_wrap_name[0] = '\0';
+		cur_wrap_addr = 0;
+	}
 	if (target_addr) {
 		strscpy(cur_tgt_name, sym_name, sizeof(cur_tgt_name));
 		cur_tgt_addr = target_addr;
@@ -122,7 +130,10 @@ int susfs_hk_inline_hook(struct hk_inline *h,
 	}
 	spin_unlock_irqrestore(&susfs_hk_sym_lock, flags);
 
-	rc = hk_inline_hook(h, sym_name, wrap_name);
+	if (tramp_out)
+		rc = hk_inline_hook_stub(h, sym_name, (unsigned long)fn, tramp_out);
+	else
+		rc = hk_inline_hook(h, sym_name, wrap_name);
 
 	spin_lock_irqsave(&susfs_hk_sym_lock, flags);
 	cur_wrap_name[0] = '\0';
@@ -133,6 +144,24 @@ int susfs_hk_inline_hook(struct hk_inline *h,
 
 	mutex_unlock(&susfs_hk_ctl_lock);
 	return rc;
+}
+
+int susfs_hk_inline_hook(struct hk_inline *h,
+			 const char *sym_name, unsigned long target_addr,
+			 const char *wrap_name, void *wrap_fn)
+{
+	return susfs_hk_inline_install(h, sym_name, target_addr,
+				       wrap_name, wrap_fn, NULL);
+}
+
+int susfs_hk_inline_hook_stub(struct hk_inline *h,
+			      const char *sym_name, unsigned long target_addr,
+			      void *stub_fn, unsigned long *tramp_out)
+{
+	if (!tramp_out)
+		return -EINVAL;
+	return susfs_hk_inline_install(h, sym_name, target_addr,
+				       NULL, stub_fn, tramp_out);
 }
 
 void susfs_hk_inline_unhook(struct hk_inline *h)

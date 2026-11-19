@@ -199,6 +199,9 @@ static void susfs_tw_func(struct callback_head *cb)
 	case CMD_SUSFS_SET_PRIORITY_UID_FILTER:
 		susfs_set_priority_uid_filter(&arg);
 		break;
+	case CMD_SUSFS_SET_SUS_PATH_UID_FILTER:
+		susfs_set_sus_path_uid_filter(&arg);
+		break;
 	default:
 		/* Unreachable: reboot_pre() only defers a command susfs_cmd_handled()
 		 * accepted.  Kept as a net in case the two lists drift apart. */
@@ -233,6 +236,7 @@ static int susfs_cmd_feature(unsigned int cmd)
 	switch (cmd) {
 	case CMD_SUSFS_ADD_SUS_PATH:
 	case CMD_SUSFS_ADD_SUS_PATH_LOOP:
+	case CMD_SUSFS_SET_SUS_PATH_UID_FILTER:
 		return SUSFS_FEAT_SUS_PATH;
 	case CMD_SUSFS_ADD_SUS_MAP:
 		return SUSFS_FEAT_SUS_MAP;
@@ -466,6 +470,9 @@ static void __init susfs_abi_layout_check(void)
 
 	BUILD_BUG_ON(sizeof(struct st_susfs_enabled_features) != 8196);
 	BUILD_BUG_ON(offsetof(struct st_susfs_enabled_features, err) != 8192);
+
+	BUILD_BUG_ON(sizeof(struct st_susfs_sus_path_uid_filter) != 65540);
+	BUILD_BUG_ON(offsetof(struct st_susfs_sus_path_uid_filter, err) != 65536);
 
 	BUILD_BUG_ON(sizeof(struct st_susfs_priority_uid_filter) != 65540);
 	BUILD_BUG_ON(offsetof(struct st_susfs_priority_uid_filter, err) != 65536);

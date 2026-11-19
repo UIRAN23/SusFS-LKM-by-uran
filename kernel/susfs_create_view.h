@@ -62,6 +62,7 @@ struct susfs_create_view {
 	uid_t caller_uid;
 	bool caller_is_app;
 	bool caller_is_su;
+	bool caller_path_allowed;
 	bool hide_from_apps;
 	bool control_visible;
 
@@ -99,7 +100,7 @@ susfs_create_decide_core(const struct susfs_create_view *v)
 
 			if (v->self_protect)
 				hidden = !v->control_visible;
-			else if (v->ordinary_rule)
+			else if (v->ordinary_rule && !v->caller_path_allowed)
 				hidden = !v->hide_from_apps || v->caller_is_app;
 			if (hidden)
 				d.action = SUSFS_CREATE_HIDE;
@@ -125,7 +126,7 @@ susfs_create_decide_core(const struct susfs_create_view *v)
 	{
 		bool hidden = false;
 
-		if (v->ordinary_rule) {
+		if (v->ordinary_rule && !v->caller_path_allowed) {
 			/* hide_from_apps=0 applies the set to every process; otherwise the
 			 * upstream gate is app-only and never hides the owner's own object. */
 			if (!v->hide_from_apps ||

@@ -55,14 +55,28 @@
 #define __NR_getpriority		141
 #endif
 
-struct susfs_priority_uid_filter_bitmap {
+struct susfs_uid_filter_bitmap {
 	struct rcu_head		rcu;
 	unsigned long		bits[SUSFS_PRIORITY_UID_FILTER_BITMAP_LEN];
 };
 
-static struct susfs_priority_uid_filter_bitmap __rcu *priority_uid_filter_bitmap;
-static DEFINE_MUTEX(susfs_mutex_lock_priority_uid_filter);
-static char *susfs_priority_app_strings = NULL;
+struct susfs_uid_filter_state {
+	const char				*name;
+	struct susfs_uid_filter_bitmap __rcu	*bitmap;
+	struct mutex				lock;
+	char					*app_strings;
+};
+
+static struct susfs_uid_filter_state priority_uid_filter = {
+	.name = "priority",
+	.lock = __MUTEX_INITIALIZER(priority_uid_filter.lock),
+};
+
+static struct susfs_uid_filter_state sus_path_uid_filter = {
+	.name = "sus_path",
+	.lock = __MUTEX_INITIALIZER(sus_path_uid_filter.lock),
+};
+
 static atomic_t susfs_priority_app_strings_running = ATOMIC_INIT(0);
 static DECLARE_WAIT_QUEUE_HEAD(susfs_priority_worker_wait);
 static bool susfs_priority_stopping;
@@ -71,6 +85,16 @@ static int priority_hooks_armed;
 /* Resolved dynamically from kernel/KernelSU if available */
 static void (*fn_setup_selinux)(const char *domain, struct cred *cred);
 static bool (*fn_is_current_ksu_domain)(void);
+static bool ksu_helpers_resolved;
+
+static void susfs_ensure_ksu_helpers(void)
+{
+	if (READ_ONCE(ksu_helpers_resolved))
+		return;
+	fn_setup_selinux = (void *)find_kernel_symbol_exact_any("setup_selinux");
+	fn_is_current_ksu_domain = (void *)find_kernel_symbol_exact_any("susfs_is_current_ksu_domain");
+	WRITE_ONCE(ksu_helpers_resolved, true);
+}
 
 static bool susfs_is_valid_app_name(const char *app_name)
 {
@@ -228,7 +252,8 @@ static int susfs_resolve_priority_app_uid(const char *app_name, uid_t *uid)
 	return -ENOENT;
 }
 
-static int susfs_parse_priority_app_names(char *app_str, unsigned long *bits, bool skip_failed)
+static int susfs_parse_uid_filter_names(const char *filter_name, char *app_str,
+					unsigned long *bits, bool skip_failed)
 {
 	char *token = NULL;
 	char *saveptr = app_str;
@@ -262,21 +287,24 @@ static int susfs_parse_priority_app_names(char *app_str, unsigned long *bits, bo
 		}
 
 		set_bit(uid - SUSFS_PRIORITY_UID_FILTER_MIN_UID, bits);
-		SUSFS_LOGI("app_name '%s', uid '%u' added to priority filter\n", token, uid);
+		SUSFS_LOGI("app_name '%s', uid '%u' added to %s filter\n", token, uid, filter_name);
 	}
 
 	return 0;
 }
 
-void susfs_set_priority_uid_filter(void __user **user_info)
+static void susfs_uid_filter_set(struct susfs_uid_filter_state *st,
+				 void __user **user_info, const char *cmd_name)
 {
 	struct st_susfs_priority_uid_filter *info = NULL;
-	struct susfs_priority_uid_filter_bitmap *new_bitmap = NULL;
-	struct susfs_priority_uid_filter_bitmap *old_bitmap = NULL;
+	struct susfs_uid_filter_bitmap *new_bitmap = NULL;
+	struct susfs_uid_filter_bitmap *old_bitmap = NULL;
 	char *new_app_strings = NULL;
 	struct cred *orig_cred = NULL;
 	size_t app_str_len = 0;
 	int err = 0;
+
+	susfs_ensure_ksu_helpers();
 
 	info = kvmalloc(sizeof(*info), GFP_KERNEL | __GFP_ZERO);
 	if (!info) {
@@ -321,28 +349,28 @@ void susfs_set_priority_uid_filter(void __user **user_info)
 		goto out_free_new_bitmap;
 	}
 
-	err = susfs_parse_priority_app_names(info->app_strings, new_bitmap->bits, true);
+	err = susfs_parse_uid_filter_names(st->name, info->app_strings, new_bitmap->bits, true);
 	susfs_restore_creds(orig_cred);
 	orig_cred = NULL;
 
 	if (err)
 		goto out_free_new_bitmap;
 
-	mutex_lock(&susfs_mutex_lock_priority_uid_filter);
-	old_bitmap = rcu_dereference_protected(priority_uid_filter_bitmap,
-					       lockdep_is_held(&susfs_mutex_lock_priority_uid_filter));
-	rcu_assign_pointer(priority_uid_filter_bitmap, new_bitmap);
+	mutex_lock(&st->lock);
+	old_bitmap = rcu_dereference_protected(st->bitmap,
+					       lockdep_is_held(&st->lock));
+	rcu_assign_pointer(st->bitmap, new_bitmap);
 	new_bitmap = NULL;
-	kvfree(susfs_priority_app_strings);
-	susfs_priority_app_strings = new_app_strings;
+	kvfree(st->app_strings);
+	st->app_strings = new_app_strings;
 	new_app_strings = NULL;
-	mutex_unlock(&susfs_mutex_lock_priority_uid_filter);
+	mutex_unlock(&st->lock);
 
 	synchronize_rcu();
 	if (old_bitmap)
 		kfree_rcu(old_bitmap, rcu);
 
-	SUSFS_LOGI("the priority uid filter is set\n");
+	SUSFS_LOGI("the %s uid filter is set\n", st->name);
 	err = 0;
 
 out_free_new_bitmap:
@@ -354,65 +382,84 @@ out_free_new_app_strings:
 out_copy_to_user:
 	if (copy_to_user(&((struct st_susfs_priority_uid_filter __user *)*user_info)->err, &err, sizeof(err)))
 		err = -EFAULT;
-	SUSFS_LOGI("CMD_SUSFS_SET_PRIORITY_UID_FILTER -> ret: %d\n", err);
+	SUSFS_LOGI("%s -> ret: %d\n", cmd_name, err);
 	if (info)
 		kvfree(info);
 }
 
-static int susfs_priority_app_strings_worker(void *data)
+void susfs_set_priority_uid_filter(void __user **user_info)
 {
-	struct susfs_priority_uid_filter_bitmap *new_bitmap = NULL;
-	struct susfs_priority_uid_filter_bitmap *old_bitmap = NULL;
-	struct cred *orig_cred = NULL;
+	susfs_uid_filter_set(&priority_uid_filter, user_info, "CMD_SUSFS_SET_PRIORITY_UID_FILTER");
+}
+
+void susfs_set_sus_path_uid_filter(void __user **user_info)
+{
+	susfs_uid_filter_set(&sus_path_uid_filter, user_info, "CMD_SUSFS_SET_SUS_PATH_UID_FILTER");
+}
+
+static int susfs_uid_filter_refresh_slot(struct susfs_uid_filter_state *st)
+{
+	struct susfs_uid_filter_bitmap *new_bitmap = NULL;
+	struct susfs_uid_filter_bitmap *old_bitmap = NULL;
 	char *app_strings = NULL;
 	size_t app_str_len = 0;
 	int ret = 0;
 
-	orig_cred = susfs_switch_to_ksu_domain();
-	if (!orig_cred)
-		goto out;
-
-	mutex_lock(&susfs_mutex_lock_priority_uid_filter);
-	if (susfs_priority_app_strings) {
-		app_str_len = strlen(susfs_priority_app_strings);
+	mutex_lock(&st->lock);
+	if (st->app_strings) {
+		app_str_len = strlen(st->app_strings);
 		app_strings = kvmalloc(app_str_len + 1, GFP_KERNEL | __GFP_ZERO);
 		if (app_strings)
-			memcpy(app_strings, susfs_priority_app_strings, app_str_len + 1);
+			memcpy(app_strings, st->app_strings, app_str_len + 1);
 	}
-	mutex_unlock(&susfs_mutex_lock_priority_uid_filter);
+	mutex_unlock(&st->lock);
 
 	if (!app_strings)
-		goto out_restore_creds;
+		return 0;
 
 	new_bitmap = kzalloc(sizeof(*new_bitmap), GFP_KERNEL);
-	if (!new_bitmap)
-		goto out_restore_creds;
+	if (!new_bitmap) {
+		kvfree(app_strings);
+		return -ENOMEM;
+	}
 
-	ret = susfs_parse_priority_app_names(app_strings, new_bitmap->bits, true);
-	if (ret)
-		goto out_restore_creds;
+	ret = susfs_parse_uid_filter_names(st->name, app_strings, new_bitmap->bits, true);
+	kvfree(app_strings);
+	if (ret) {
+		kfree(new_bitmap);
+		return ret;
+	}
 
-	mutex_lock(&susfs_mutex_lock_priority_uid_filter);
-	old_bitmap = rcu_dereference_protected(priority_uid_filter_bitmap,
-					       lockdep_is_held(&susfs_mutex_lock_priority_uid_filter));
-	rcu_assign_pointer(priority_uid_filter_bitmap, new_bitmap);
-	new_bitmap = NULL;
-	mutex_unlock(&susfs_mutex_lock_priority_uid_filter);
+	mutex_lock(&st->lock);
+	old_bitmap = rcu_dereference_protected(st->bitmap,
+					       lockdep_is_held(&st->lock));
+	rcu_assign_pointer(st->bitmap, new_bitmap);
+	mutex_unlock(&st->lock);
 
 	synchronize_rcu();
 	if (old_bitmap)
 		kfree_rcu(old_bitmap, rcu);
 
-	SUSFS_LOGI("the uids of the priority uid filter are resolved again\n");
+	SUSFS_LOGI("the uids of the %s uid filter are resolved again\n", st->name);
+	return 0;
+}
 
-out_restore_creds:
+static int susfs_priority_app_strings_worker(void *data)
+{
+	struct cred *orig_cred = NULL;
+	int ret = 0;
+
+	susfs_ensure_ksu_helpers();
+	orig_cred = susfs_switch_to_ksu_domain();
+	if (!orig_cred)
+		goto out;
+
+	ret = susfs_uid_filter_refresh_slot(&priority_uid_filter);
+	if (!ret)
+		ret = susfs_uid_filter_refresh_slot(&sus_path_uid_filter);
+
 	susfs_restore_creds(orig_cred);
-	orig_cred = NULL;
 out:
-	if (new_bitmap)
-		kfree(new_bitmap);
-	if (app_strings)
-		kvfree(app_strings);
 	atomic_set(&susfs_priority_app_strings_running, 0);
 	wake_up_all(&susfs_priority_worker_wait);
 
@@ -439,9 +486,9 @@ void susfs_parse_priority_app_strings(void)
 }
 EXPORT_SYMBOL_GPL(susfs_parse_priority_app_strings);
 
-bool susfs_is_priority_uid_filtered(uid_t uid)
+static bool susfs_uid_filter_test(struct susfs_uid_filter_state *st, uid_t uid)
 {
-	struct susfs_priority_uid_filter_bitmap *bitmap;
+	struct susfs_uid_filter_bitmap *bitmap;
 	uid_t app_id = uid % 100000;
 	bool filtered = false;
 
@@ -450,7 +497,7 @@ bool susfs_is_priority_uid_filtered(uid_t uid)
 		return false;
 
 	rcu_read_lock();
-	bitmap = rcu_dereference(priority_uid_filter_bitmap);
+	bitmap = rcu_dereference(st->bitmap);
 	if (likely(bitmap)) {
 		if (test_bit(app_id - SUSFS_PRIORITY_UID_FILTER_MIN_UID, bitmap->bits))
 			filtered = true;
@@ -458,6 +505,16 @@ bool susfs_is_priority_uid_filtered(uid_t uid)
 	rcu_read_unlock();
 
 	return filtered;
+}
+
+bool susfs_is_priority_uid_filtered(uid_t uid)
+{
+	return susfs_uid_filter_test(&priority_uid_filter, uid);
+}
+
+bool susfs_is_sus_path_uid_allowed(uid_t uid)
+{
+	return susfs_uid_filter_test(&sus_path_uid_filter, uid);
 }
 EXPORT_SYMBOL_GPL(susfs_is_priority_uid_filtered);
 
@@ -637,22 +694,19 @@ bool susfs_priority_active(void)
 	return READ_ONCE(priority_hooks_armed) > 0;
 }
 
-/* Diagnostic /proc node */
-static int priority_proc_show(struct seq_file *m, void *v)
+static void priority_proc_show_slot(struct seq_file *m, struct susfs_uid_filter_state *st,
+				    const char *pkg_label, const char *cnt_label)
 {
-	struct susfs_priority_uid_filter_bitmap *bitmap;
+	struct susfs_uid_filter_bitmap *bitmap;
 	int i, count = 0;
 
-	seq_printf(m, "priority_uid_filter: %s\n",
-		   susfs_priority_active() ? "active" : "inactive");
-
-	mutex_lock(&susfs_mutex_lock_priority_uid_filter);
-	seq_printf(m, "stored_packages: %s\n",
-		   susfs_priority_app_strings ? susfs_priority_app_strings : "(none)");
-	mutex_unlock(&susfs_mutex_lock_priority_uid_filter);
+	mutex_lock(&st->lock);
+	seq_printf(m, "%s: %s\n", pkg_label,
+		   st->app_strings ? st->app_strings : "(none)");
+	mutex_unlock(&st->lock);
 
 	rcu_read_lock();
-	bitmap = rcu_dereference(priority_uid_filter_bitmap);
+	bitmap = rcu_dereference(st->bitmap);
 	if (bitmap) {
 		for (i = 0; i < SUSFS_PRIORITY_UID_FILTER_UID_NUM; i++) {
 			if (test_bit(i, bitmap->bits))
@@ -661,7 +715,18 @@ static int priority_proc_show(struct seq_file *m, void *v)
 	}
 	rcu_read_unlock();
 
-	seq_printf(m, "filtered_uids_count: %d\n", count);
+	seq_printf(m, "%s: %d\n", cnt_label, count);
+}
+
+/* Diagnostic /proc node */
+static int priority_proc_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "priority_uid_filter: %s\n",
+		   susfs_priority_active() ? "active" : "inactive");
+	priority_proc_show_slot(m, &priority_uid_filter,
+				"stored_packages", "filtered_uids_count");
+	priority_proc_show_slot(m, &sus_path_uid_filter,
+				"sus_path_allowed_packages", "sus_path_allowed_uids_count");
 	return 0;
 }
 
@@ -688,8 +753,7 @@ int susfs_priority_init(void)
 	WRITE_ONCE(susfs_priority_stopping, false);
 	priority_hooks_armed = 0;
 
-	fn_setup_selinux = (void *)find_kernel_symbol_exact_any("setup_selinux");
-	fn_is_current_ksu_domain = (void *)find_kernel_symbol_exact_any("susfs_is_current_ksu_domain");
+	susfs_ensure_ksu_helpers();
 
 	for (i = 0; i < ARRAY_SIZE(priority_hooks); i++) {
 		err = susfs_fp_install(&priority_hooks[i]);
@@ -718,9 +782,25 @@ int susfs_priority_init(void)
 	return 0;
 }
 
+static void susfs_uid_filter_release(struct susfs_uid_filter_state *st)
+{
+	struct susfs_uid_filter_bitmap *bitmap;
+
+	mutex_lock(&st->lock);
+	bitmap = rcu_dereference_protected(st->bitmap,
+					   lockdep_is_held(&st->lock));
+	rcu_assign_pointer(st->bitmap, NULL);
+	kvfree(st->app_strings);
+	st->app_strings = NULL;
+	mutex_unlock(&st->lock);
+
+	synchronize_rcu();
+	if (bitmap)
+		kfree_rcu(bitmap, rcu);
+}
+
 void susfs_priority_exit(void)
 {
-	struct susfs_priority_uid_filter_bitmap *bitmap;
 	int i;
 
 	WRITE_ONCE(susfs_priority_stopping, true);
@@ -741,17 +821,8 @@ void susfs_priority_exit(void)
 		priority_hooks_armed = 0;
 	}
 
-	mutex_lock(&susfs_mutex_lock_priority_uid_filter);
-	bitmap = rcu_dereference_protected(priority_uid_filter_bitmap,
-					   lockdep_is_held(&susfs_mutex_lock_priority_uid_filter));
-	rcu_assign_pointer(priority_uid_filter_bitmap, NULL);
-	kvfree(susfs_priority_app_strings);
-	susfs_priority_app_strings = NULL;
-	mutex_unlock(&susfs_mutex_lock_priority_uid_filter);
-
-	synchronize_rcu();
-	if (bitmap)
-		kfree_rcu(bitmap, rcu);
+	susfs_uid_filter_release(&priority_uid_filter);
+	susfs_uid_filter_release(&sus_path_uid_filter);
 
 	SUSFS_LOGI("priority uid filter removed\n");
 }

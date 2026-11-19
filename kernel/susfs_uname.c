@@ -1,32 +1,43 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * susfs_uname.c - spoof uname release/version (SUSFS SPOOF_UNAME).  Upstream patches the body of
- * SYSCALL_DEFINE1(newuname) between the memcpy(utsname) and copy_to_user; the LKM equivalent hooks
- * __arm64_sys_newuname with a kretprobe and rewrites the release/version fields of the user buffer just before
- * the syscall returns - the target pages were just faulted in by the original copy_to_user, so the handler's
- * copy_to_user cannot fault, and "default" copies the device's CURRENT utsname()->release/version at runtime.
- * Upstream semantics: OFF by default, enabled by CMD_SUSFS_SET_UNAME alone, kretprobe registered lazily.
+ * susfs_uname.c - spoof uname release/version (SUSFS SPOOF_UNAME).
+ *
+ * Updates init_uts_ns under uts_sem (keeping uname(2), 32-bit compat uname,
+ * /proc/version, and /proc/sys/kernel/osrelease|/proc/sys/kernel/version
+ * consistent with one another) while keeping a PAC-safe __arm64_sys_newuname
+ * inline return-stub hook (with kretprobe fallback) so any non-init UTS
+ * namespace also sees the spoofed release/version.  Snapshots the real values
+ * at module init so "default" and module unload restore the stock identity.
  */
 #include <linux/module.h>
 #include <linux/kprobes.h>
 #include <linux/uaccess.h>
 #include <linux/utsname.h>
+#include <linux/rwsem.h>
+#include <linux/spinlock.h>
 #include <linux/string.h>
-#include <linux/mutex.h>	/* uname_ctl_lock: serialises the arm/disarm pair */
+#include <linux/mutex.h>
 #include <linux/version.h>
+#include <asm/ptrace.h>
 #include "susfs_abi.h"
 #include "susfs_log.h"
-#include "susfs.h"	/* susfs_abi_path_ok */
+#include "susfs.h"
 #include "susfs_kprobe.h"
 #include "susfs_hk.h"
+#include "symbol_resolver.h"
 
 #define SUSFS_UNAME_LEN (__NEW_UTS_LEN + 1)
 
 static char fake_release[SUSFS_UNAME_LEN];
 static char fake_version[SUSFS_UNAME_LEN];
+static char orig_release[SUSFS_UNAME_LEN];
+static char orig_version[SUSFS_UNAME_LEN];
 static bool uname_spoof_enabled;
+static DEFINE_SPINLOCK(uname_buf_lock);
 
-/* optional insmod-time override; supercall is the primary interface */
+static struct uts_namespace *init_uts_ns_ptr;
+static struct rw_semaphore *uts_sem_ptr;
+
 module_param_string(release, fake_release, sizeof(fake_release), 0644);
 module_param_string(version, fake_version, sizeof(fake_version), 0644);
 module_param(uname_spoof_enabled, bool, 0644);
@@ -34,222 +45,249 @@ MODULE_PARM_DESC(release, "fake uname release (insmod override)");
 MODULE_PARM_DESC(version, "fake uname version (insmod override)");
 MODULE_PARM_DESC(uname_spoof_enabled, "enable uname spoofing (insmod override)");
 
+extern void susfs_uname_stub(void);
+extern unsigned long susfs_uname_tramp;
+
+static struct hk_inline uname_hk;
+static bool uname_inline;
+static bool uname_registered;
+static DEFINE_MUTEX(uname_ctl_lock);
+
+static void uname_snapshot(char *rel, char *ver)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&uname_buf_lock, flags);
+	strscpy_pad(rel, fake_release, SUSFS_UNAME_LEN);
+	strscpy_pad(ver, fake_version, SUSFS_UNAME_LEN);
+	spin_unlock_irqrestore(&uname_buf_lock, flags);
+}
+
+static void uname_write_user(struct new_utsname __user *name, bool stop_on_fault)
+{
+	char rel[SUSFS_UNAME_LEN];
+	char ver[SUSFS_UNAME_LEN];
+	unsigned long uncopied;
+
+	uname_snapshot(rel, ver);
+	uncopied = copy_to_user((char __user *)name + offsetof(struct new_utsname, release),
+				rel, SUSFS_UNAME_LEN);
+	if (uncopied && stop_on_fault)
+		return;
+	(void)copy_to_user((char __user *)name + offsetof(struct new_utsname, version),
+			   ver, SUSFS_UNAME_LEN);
+}
+
+static bool uname_apply_uts(const char *rel, const char *ver)
+{
+	if (!init_uts_ns_ptr || !uts_sem_ptr)
+		return false;
+
+	down_write(uts_sem_ptr);
+	strscpy_pad(init_uts_ns_ptr->name.release, rel,
+		    sizeof(init_uts_ns_ptr->name.release));
+	strscpy_pad(init_uts_ns_ptr->name.version, ver,
+		    sizeof(init_uts_ns_ptr->name.version));
+	up_write(uts_sem_ptr);
+	return true;
+}
+
+long __nocfi susfs_uname_decide(unsigned long *saved)
+{
+	const struct pt_regs *regs = saved ? (const struct pt_regs *)saved[0] : NULL;
+	long ret = saved ? (long)saved[20] : -EINVAL;
+	struct new_utsname __user *name;
+
+	if (ret == 0 && READ_ONCE(uname_spoof_enabled) && regs) {
+		name = (struct new_utsname __user *)regs->regs[0];
+		if (name)
+			uname_write_user(name, false);
+	}
+	return ret;
+}
+
 struct uname_args {
-    struct new_utsname __user *name;
+	struct new_utsname __user *name;
 };
 
 static int kr_newuname_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
-    struct uname_args *a = (struct uname_args *)ri->data;
-    struct pt_regs *user = (struct pt_regs *)regs->regs[0];
+	struct uname_args *a = (struct uname_args *)ri->data;
+	struct pt_regs *user = (struct pt_regs *)regs->regs[0];
 
-    /* this GKI kernel does NOT auto-adjust syscall-wrapper probe regs:
-     * regs->regs[0] is the struct pt_regs* argument, not the user arg */
-    if (!user)
-        return 1;   /* no return handler: ri->data would be left stale */
-
-    a->name = (struct new_utsname __user *)user->regs[0];
-    return 0;
+	if (!user)
+		return 1;
+	a->name = (struct new_utsname __user *)user->regs[0];
+	return 0;
 }
 
 static int kr_newuname_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
-    struct uname_args *a = (struct uname_args *)ri->data;
+	struct uname_args *a = (struct uname_args *)ri->data;
 
-    if (regs_return_value(regs) != 0)
-        return 0;
-    if (!uname_spoof_enabled || !a->name)
-        return 0;
+	if (!READ_ONCE(uname_spoof_enabled) || regs_return_value(regs) != 0 || !a->name)
+		return 0;
 
-    if (copy_to_user((char __user *)a->name + offsetof(struct new_utsname, release),
-                     fake_release, SUSFS_UNAME_LEN))
-        return 0;
-    if (copy_to_user((char __user *)a->name + offsetof(struct new_utsname, version),
-                     fake_version, SUSFS_UNAME_LEN))
-        return 0;
-    return 0;
+	uname_write_user(a->name, true);
+	return 0;
 }
 
-typedef long (*uname_sys_fn)(const struct pt_regs *regs);
-static struct hk_inline uname_hk;
-static bool uname_inline_active;
-
-static __nocfi noinline long uname_newuname_wrap(const struct pt_regs *regs)
-{
-    uname_sys_fn orig = (uname_sys_fn)READ_ONCE(uname_hk.orig);
-    struct new_utsname __user *name =
-        regs ? (struct new_utsname __user *)regs->regs[0] : NULL;
-    long ret;
-
-    if (!orig)
-        return -ENOSYS;
-
-    ret = orig(regs);
-    if (ret != 0 || !READ_ONCE(uname_spoof_enabled) || !name)
-        return ret;
-
-    if (copy_to_user((char __user *)name + offsetof(struct new_utsname, release),
-                     fake_release, SUSFS_UNAME_LEN))
-        return ret;
-    if (copy_to_user((char __user *)name + offsetof(struct new_utsname, version),
-                     fake_version, SUSFS_UNAME_LEN))
-        return ret;
-    return ret;
-}
-
-static struct kretprobe krp = {
-    .kp.symbol_name = "__arm64_sys_newuname",
-    .entry_handler = kr_newuname_entry,
-    .handler = kr_newuname_ret,
-    .data_size = sizeof(struct uname_args),
-    .maxactive = 32,
+static struct kretprobe kr_newuname = {
+	.kp.symbol_name = "__arm64_sys_newuname",
+	.entry_handler = kr_newuname_entry,
+	.handler = kr_newuname_ret,
+	.data_size = sizeof(struct uname_args),
+	.maxactive = 32,
 };
-
-static bool uname_registered;
-
-/* Serialises the arm/disarm pair - the full reasoning is in susfs_avc_spoof.c's avc_ctl_lock:
- * register_kprobe() answers -EINVAL once another task has resolved .addr, and the failure branch
- * below clears .addr - which, without this lock, disarms a probe that is LIVE without ever
- * unregistering it, leaving its breakpoint installed after the module is freed.  Two tasks can
- * send CMD_SUSFS_SET_UNAME at the same time (each supercall runs in its own task_work). */
-static DEFINE_MUTEX(uname_ctl_lock);
 
 static int uname_register(void)
 {
-    int rc;
+	int rc;
 
-    mutex_lock(&uname_ctl_lock);
-    if (uname_registered) {
-        mutex_unlock(&uname_ctl_lock);
-        return 0;
-    }
-    if (susfs_hk_ready()) {
-        rc = susfs_hk_inline_hook(&uname_hk, "__arm64_sys_newuname", 0,
-                                  "uname_newuname_wrap", uname_newuname_wrap);
-        if (!rc) {
-            uname_inline_active = true;
-            uname_registered = true;
-            mutex_unlock(&uname_ctl_lock);
-            SUSFS_LOGI("uname spoof armed (inline): release=%s version=%s\n",
-                    fake_release, fake_version);
-            return 0;
-        }
-        pr_info("susfs_uname: inline hook on __arm64_sys_newuname failed (%d), falling back to kretprobe\n",
-                rc);
-    }
-    rc = register_kretprobe(&krp);
-    if (rc) {
-        /* CMD_SUSFS_SET_UNAME can be sent again after a failure, and the address the kernel
-         * resolved is already in the struct: without this the retry is refused with -EINVAL
-         * and the spoof can never be turned on - see susfs_kprobe.h.  Safe under the lock. */
-        susfs_krp_forget_addr(&krp);
-        mutex_unlock(&uname_ctl_lock);
-        return rc;
-    }
-    uname_inline_active = false;
-    uname_registered = true;
-    mutex_unlock(&uname_ctl_lock);
-    SUSFS_LOGI("uname spoof armed (kretprobe): release=%s version=%s\n",
-            fake_release, fake_version);
-    return 0;
+	if (uname_registered)
+		return 0;
+	if (susfs_hk_ready()) {
+		rc = susfs_hk_inline_hook_stub(&uname_hk, "__arm64_sys_newuname", 0,
+					       susfs_uname_stub, &susfs_uname_tramp);
+		if (!rc) {
+			uname_inline = true;
+			uname_registered = true;
+			SUSFS_LOGI("uname spoof armed inline\n");
+			return 0;
+		}
+		pr_info("susfs_uname: inline stub hook on __arm64_sys_newuname failed (%d), falling back to kretprobe\n",
+			rc);
+	}
+	rc = register_kretprobe(&kr_newuname);
+	if (rc) {
+		susfs_krp_forget_addr(&kr_newuname);
+		return rc;
+	}
+	uname_registered = true;
+	return 0;
 }
 
-static void uname_unregister(void)
+static void uname_pad_field(char *buf)
 {
-    mutex_lock(&uname_ctl_lock);
-    if (!uname_registered) {
-        mutex_unlock(&uname_ctl_lock);
-        return;
-    }
-    if (uname_inline_active) {
-        susfs_hk_inline_unhook(&uname_hk);
-        uname_inline_active = false;
-    } else {
-        unregister_kretprobe(&krp);
-        susfs_krp_forget_addr(&krp);
-    }
-    uname_registered = false;
-    mutex_unlock(&uname_ctl_lock);
-}
+	size_t n = strnlen(buf, SUSFS_UNAME_LEN);
 
-/* The insmod/sysfs parameter path does not go through the supercall's strscpy_pad(): the
- * kernel's own param_set_copystring() strcpy()s into the buffer and leaves the rest of it
- * alone, so a value that arrived that way needs the same padding before it is handed out. */
-static void uname_pad(char *s, size_t size)
-{
-    size_t n = strnlen(s, size);
-
-    if (n < size)
-        memset(s + n, 0, size - n);
+	if (n < SUSFS_UNAME_LEN)
+		memset(buf + n, 0, SUSFS_UNAME_LEN - n);
 }
 
 int susfs_uname_init(void)
 {
-    uname_pad(fake_release, sizeof(fake_release));
-    uname_pad(fake_version, sizeof(fake_version));
+	const struct new_utsname *u = utsname();
+	bool uts_ok = false;
+	int rc;
 
-    if (uname_spoof_enabled && fake_release[0] && fake_version[0]) {
-        int rc = uname_register();
+	BUILD_BUG_ON(SUSFS_UNAME_LEN != sizeof(u->release));
+	BUILD_BUG_ON(SUSFS_UNAME_LEN != sizeof(u->version));
 
-        if (rc)
-            pr_warn("susfs_uname: hook(newuname) failed %d\n", rc);
-    } else {
-        SUSFS_LOGI("uname spoof: disabled (enable via CMD_SUSFS_SET_UNAME)\n");
-    }
-    return 0;
+	strscpy_pad(orig_release, u->release, sizeof(orig_release));
+	strscpy_pad(orig_version, u->version, sizeof(orig_version));
+
+	init_uts_ns_ptr = (struct uts_namespace *)find_kernel_symbol_exact("init_uts_ns");
+	uts_sem_ptr = (struct rw_semaphore *)find_kernel_symbol_exact("uts_sem");
+
+	uname_pad_field(fake_release);
+	uname_pad_field(fake_version);
+
+	if (READ_ONCE(uname_spoof_enabled) && (fake_release[0] || fake_version[0])) {
+		if (!fake_release[0])
+			strscpy_pad(fake_release, orig_release, sizeof(fake_release));
+		if (!fake_version[0])
+			strscpy_pad(fake_version, orig_version, sizeof(fake_version));
+		uts_ok = uname_apply_uts(fake_release, fake_version);
+		rc = uname_register();
+		if (rc && !uts_ok)
+			pr_warn("susfs_uname: hook(newuname) failed %d\n", rc);
+		else
+			SUSFS_LOGI("uname spoof armed: release=%s version=%s (uts=%s)\n",
+				   fake_release, fake_version, uts_ok ? "ok" : "hook-only");
+	} else {
+		SUSFS_LOGI("uname spoof: disabled (enable via CMD_SUSFS_SET_UNAME; uts=%s)\n",
+			   (init_uts_ns_ptr && uts_sem_ptr) ? "ready" : "hook-only");
+	}
+	return 0;
 }
 
 void susfs_uname_exit(void)
 {
-    uname_unregister();
+	mutex_lock(&uname_ctl_lock);
+	WRITE_ONCE(uname_spoof_enabled, false);
+	uname_apply_uts(orig_release, orig_version);
+	if (uname_registered) {
+		if (uname_inline) {
+			susfs_hk_inline_unhook(&uname_hk);
+			uname_inline = false;
+		} else {
+			unregister_kretprobe(&kr_newuname);
+			susfs_krp_forget_addr(&kr_newuname);
+		}
+		uname_registered = false;
+	}
+	mutex_unlock(&uname_ctl_lock);
 }
 
-/* supercall: CMD_SUSFS_SET_UNAME */
 void susfs_uname_supercall(void __user **arg)
 {
-    struct st_susfs_uname info = {0};
-    int rc;
+	struct st_susfs_uname info = { 0 };
+	char new_rel[SUSFS_UNAME_LEN];
+	char new_ver[SUSFS_UNAME_LEN];
+	const char *rel;
+	const char *ver;
+	unsigned long flags;
+	bool is_custom, uts_ok;
+	int rc = 0;
 
-    if (copy_from_user(&info, (void __user *)*arg, sizeof(info))) {
-        info.err = -EFAULT;
-        goto out;
-    }
-    if (*info.release == '\0' || *info.version == '\0') {
-        /* -EINVAL: the buffer came across fine, the VALUE is what is wrong. */
-        info.err = -EINVAL;
-        goto out;
-    }
-    /* char[65] ABI fields the caller need not terminate; strcmp() and strscpy() below would run past the end. */
-    if (!susfs_abi_path_ok(info.release, sizeof(info.release)) ||
-        !susfs_abi_path_ok(info.version, sizeof(info.version))) {
-        info.err = -ENAMETOOLONG;
-        goto out;
-    }
+	if (copy_from_user(&info, (void __user *)*arg, sizeof(info))) {
+		info.err = -EFAULT;
+		goto out;
+	}
+	if (!info.release[0] || !info.version[0]) {
+		info.err = -EINVAL;
+		goto out;
+	}
+	if (!susfs_abi_path_ok(info.release, sizeof(info.release)) ||
+	    !susfs_abi_path_ok(info.version, sizeof(info.version))) {
+		info.err = -ENAMETOOLONG;
+		goto out;
+	}
 
-    /* "default" copies the device's CURRENT uname at runtime */
-    /* strscpy_pad(), not strscpy(): the kernel's own utsname fields are zero-padded to their
-     * full width, so an unpadded copy hands the caller the tail of whatever longer value was
-     * set before - residue no genuine uname(2) can produce. */
-    if (!strcmp(info.release, "default"))
-        strscpy_pad(fake_release, utsname()->release, sizeof(fake_release));
-    else
-        strscpy_pad(fake_release, info.release, sizeof(fake_release));
-    if (!strcmp(info.version, "default"))
-        strscpy_pad(fake_version, utsname()->version, sizeof(fake_version));
-    else
-        strscpy_pad(fake_version, info.version, sizeof(fake_version));
+	rel = !strcmp(info.release, "default") ? orig_release : info.release;
+	ver = !strcmp(info.version, "default") ? orig_version : info.version;
+	strscpy_pad(new_rel, rel, sizeof(new_rel));
+	strscpy_pad(new_ver, ver, sizeof(new_ver));
+	is_custom = strcmp(new_rel, orig_release) || strcmp(new_ver, orig_version);
 
-    uname_spoof_enabled = true;
-    rc = uname_register();
-    if (rc) {
-        info.err = rc;
-        goto out;
-    }
-    info.err = 0;
-    SUSFS_LOGI("uname spoof set: release=%s version=%s\n", fake_release, fake_version);
+	mutex_lock(&uname_ctl_lock);
+	spin_lock_irqsave(&uname_buf_lock, flags);
+	strscpy_pad(fake_release, new_rel, sizeof(fake_release));
+	strscpy_pad(fake_version, new_ver, sizeof(fake_version));
+	spin_unlock_irqrestore(&uname_buf_lock, flags);
+
+	uts_ok = uname_apply_uts(new_rel, new_ver);
+	WRITE_ONCE(uname_spoof_enabled, is_custom);
+	if (is_custom) {
+		rc = uname_register();
+		if (rc && uts_ok) {
+			pr_warn("susfs_uname: hook(newuname) failed %d (init_uts_ns updated)\n", rc);
+			rc = 0;
+		}
+	}
+	info.err = rc;
+	if (!rc) {
+		if (is_custom)
+			SUSFS_LOGI("uname spoof set: release=%s version=%s (uts=%s)\n",
+				   new_rel, new_ver, uts_ok ? "ok" : "hook-only");
+		else
+			SUSFS_LOGI("uname spoof reset to stock: release=%s version=%s\n",
+				   new_rel, new_ver);
+	}
+	mutex_unlock(&uname_ctl_lock);
 out:
-    /* upstream writes back only ->err for input-type commands */
-    if (copy_to_user(&((struct st_susfs_uname __user *)*arg)->err,
-                     &info.err, sizeof(info.err)))
-        pr_warn("uname supercall copy_to_user failed\n");
+	if (copy_to_user(&((struct st_susfs_uname __user *)*arg)->err,
+			 &info.err, sizeof(info.err)))
+		pr_warn("uname supercall copy_to_user failed\n");
 }

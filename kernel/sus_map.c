@@ -632,8 +632,16 @@ static struct kprobe kp_gup_remote = {
     .pre_handler = sus_map_vm_access_pre,
 };
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 2, 0)
+/* __get_user_pages_remote was removed in v6.2; process_vm_rw_single_vec
+ * calls pin_user_pages_remote directly from v6.2 onwards. */
+#define SUS_MAP_GUP_INNER_NAME	"pin_user_pages_remote"
+#else
+#define SUS_MAP_GUP_INNER_NAME	"__get_user_pages_remote"
+#endif
+
 static struct kprobe kp_gup_remote_inner = {
-    .symbol_name = "__get_user_pages_remote",
+    .symbol_name = SUS_MAP_GUP_INNER_NAME,
     .pre_handler = sus_map_vm_access_pre,
 };
 

@@ -3,6 +3,10 @@
  * Copyright (C) 2026 dere3046
  */
 
+#ifndef pr_fmt
+#define pr_fmt(fmt) "susfs_guard_lkm: " fmt
+#endif
+
 #include <linux/crc32.h>
 #include <linux/errno.h>
 #include <linux/kernel.h>

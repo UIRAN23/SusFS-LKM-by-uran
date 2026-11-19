@@ -525,6 +525,8 @@ static inline bool sus_path_gate(struct inode *inode)
 {
     if (!hide_from_apps)
         return true;
+    if (susfs_is_sus_path_uid_allowed(current_uid().val))
+        return false;
     if (!susfs_is_current_proc_umounted_app())
         return false;
     return !inode || current_uid().val != inode->i_uid.val;
@@ -827,7 +829,7 @@ static void sus_path_pending_work(struct work_struct *w)
     if (resolved > 0)
         atomic_set(&sus_path_pending_tries, 0);     /* progress: keep trying */
 
-    if (atomic_inc_return(&sus_path_pending_tries) > SUS_PATH_PENDING_TRIES) {
+    if ((unsigned int)atomic_inc_return(&sus_path_pending_tries) > SUS_PATH_PENDING_TRIES) {
         SUSFS_LOGI("sus_path: %d rule(s) still pending after %d retries (last walk rc=%d) - retry timer stops; they hide nothing until they resolve, the next add tries again\n",
                 atomic_read(&sus_path_n_pending), SUS_PATH_PENDING_TRIES,
                 atomic_read(&sus_path_pend_last_rc));
@@ -1250,6 +1252,7 @@ static void sus_path_view_fill(struct sus_path_view *v, enum sus_path_face face,
     v->caller_uid = current_uid().val;
     v->caller_is_app = susfs_is_current_proc_umounted_app();
     v->caller_is_su = ctrl_vis;
+    v->caller_path_allowed = susfs_is_sus_path_uid_allowed(v->caller_uid);
     v->hide_from_apps = sus_path_hide_from_apps();
     v->control_visible = ctrl_vis;
 }

@@ -22,6 +22,7 @@
 #define CMD_SUSFS_SET_ANDROID_DATA_ROOT_PATH    0x55551 /* deprecated */
 #define CMD_SUSFS_SET_SDCARD_ROOT_PATH          0x55552 /* deprecated */
 #define CMD_SUSFS_ADD_SUS_PATH_LOOP             0x55553
+#define CMD_SUSFS_SET_SUS_PATH_UID_FILTER       0x55554
 #define CMD_SUSFS_ADD_SUS_MOUNT                 0x55560 /* deprecated */
 #define CMD_SUSFS_HIDE_SUS_MNTS_FOR_NON_SU_PROCS 0x55561
 #define CMD_SUSFS_UMOUNT_FOR_ZYGOTE_ISO_SERVICE 0x55562 /* deprecated */
@@ -158,6 +159,11 @@ struct st_susfs_enabled_features {
 };
 
 #define SUSFS_APP_STR_BUF_SIZE 65535
+
+struct st_susfs_sus_path_uid_filter {
+	char app_strings[SUSFS_APP_STR_BUF_SIZE];
+	int err;
+};
 
 struct st_susfs_priority_uid_filter {
 	char app_strings[SUSFS_APP_STR_BUF_SIZE];
