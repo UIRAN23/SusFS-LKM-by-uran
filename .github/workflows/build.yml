@@ -4,7 +4,7 @@ run-name: "SusFS LKM by uran / ${{ inputs.kernel || 'universal' }}${{ inputs.pub
 on:
   push:
     branches: [main]
-    paths-ignore: ['**.md']
+    paths-ignore: ['**.md', 'docs/**']
   workflow_dispatch:
     inputs:
       kernel:
