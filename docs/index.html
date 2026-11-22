@@ -1,0 +1,226 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SusFS LKM by uran · SUSFS как модуль ядра Android</title>
+<meta name="description" content="SUSFS в виде загружаемого модуля ядра для arm64 GKI 5.10–6.18: без пересборки ядра, с KernelSU-модулем и .ko под каждый KMI.">
+<meta name="author" content="uran">
+<meta name="theme-color" content="#2c3df0">
+<meta property="og:type" content="website">
+<meta property="og:title" content="SusFS LKM by uran">
+<meta property="og:description" content="SUSFS as a loadable kernel module for Android GKI 5.10-6.18 / SUSFS как модуль ядра для Android GKI 5.10–6.18.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%232c3df0'/%3E%3Cpath d='M8 11h16M8 16h10M8 21h13' stroke='white' stroke-width='3' stroke-linecap='round'/%3E%3Cpath d='M20 14l6 6' stroke='%23ffd479' stroke-width='3' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;600;700&family=Unbounded:wght@700;800&subset=cyrillic,latin&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="site.css">
+</head>
+<body>
+<a class="skip" href="#main"><span lang="ru">К содержимому</span><span lang="en">Skip to content</span></a>
+
+<header class="top">
+  <div class="wrap">
+    <a class="brand" href="#top">SusFS LKM</a>
+    <nav class="nav" aria-label="Main">
+      <a href="#features"><span lang="ru">Возможности</span><span lang="en">Features</span></a>
+      <a href="#install"><span lang="ru">Установка</span><span lang="en">Install</span></a>
+      <a href="#kmi">KMI</a>
+      <a href="#proc">/proc</a>
+      <a href="#build"><span lang="ru">Сборка</span><span lang="en">Build</span></a>
+      <a href="#faq">FAQ</a>
+    </nav>
+    <div class="lang" role="group" aria-label="Language">
+      <button type="button" data-l="ru" aria-pressed="true">RU</button>
+      <button type="button" data-l="en" aria-pressed="false">EN</button>
+    </div>
+  </div>
+</header>
+
+<main id="main">
+<div id="top" class="hero">
+  <div class="wrap">
+    <div>
+      <span class="ver">v2.4.0</span>
+      <h1><span lang="ru">SUSFS как модуль ядра. Без пересборки.</span><span lang="en">SUSFS as a kernel module. No rebuild.</span></h1>
+      <p class="lead">
+        <span lang="ru">Загрузите <code>.ko</code> на штатное GKI-ядро: файлы, маунты и прочие следы root пропадают из вида приложений. Выгрузили модуль, и всё как было.</span>
+        <span lang="en">Load a <code>.ko</code> on a stock GKI kernel and root traces (files, mounts and more) disappear from apps' view. Unload the module and everything is back as it was.</span>
+      </p>
+      <div class="btns">
+        <a class="btn primary" href="https://github.com/" data-gh="/releases/latest"><span lang="ru">Скачать релиз</span><span lang="en">Download release</span></a>
+        <a class="btn" href="https://github.com/" data-gh=""><span lang="ru">Исходники</span><span lang="en">Source code</span></a>
+      </div>
+      <ul class="facts">
+        <li>arm64 · Android 12+</li>
+        <li>GKI 5.10 – 6.18</li>
+        <li><span lang="ru">8 вариантов KMI</span><span lang="en">8 KMI targets</span></li>
+      </ul>
+    </div>
+
+    <div class="demo" id="demo" data-view="app">
+      <div class="demo-bar">
+        <span><span lang="ru">Что видит…</span><span lang="en">Who is looking…</span></span>
+        <span class="view" role="group" aria-label="View">
+          <button type="button" data-v="root" aria-pressed="false">root</button>
+          <button type="button" data-v="app" aria-pressed="true"><span lang="ru">приложение</span><span lang="en">app</span></button>
+        </span>
+      </div>
+<pre><span class="p">$ ls /data/adb</span><span class="row">ksud</span><span class="row sus">modules/</span><span class="row sus">ksu.log</span><span class="row">post-fs-data.d/</span><span class="row sus">susfs_guard_lkm.ko</span><span class="p">$ grep -c susfs /proc/modules</span><span class="row sus">1</span><span class="row app-only">0</span></pre>
+      <div class="note"><span lang="ru">Иллюстрация. Реальные правила вы задаёте сами через /proc/susfs_*.</span><span lang="en">Illustration. You define the real rules yourself via /proc/susfs_*.</span></div>
+    </div>
+  </div>
+</div>
+
+<section id="features">
+  <div class="wrap">
+    <h2><span lang="ru">Что умеет</span><span lang="en">What it does</span></h2>
+    <p class="sub"><span lang="ru">Те же возможности SUSFS, но в загружаемом модуле. Каждое правило включается отдельно.</span><span lang="en">The SUSFS feature set, packaged as a loadable module. Every rule is switched on separately.</span></p>
+    <dl class="feat">
+      <div><dt>sus_path</dt><dd><span lang="ru">Скрывает файлы и каталоги от приложений: stat, open, листинг каталога.</span><span lang="en">Hides files and directories from apps: stat, open, directory listings.</span></dd></div>
+      <div><dt>sus_mount</dt><dd><span lang="ru">Убирает ваши маунты из mountinfo для процессов без su; есть try_umount.</span><span lang="en">Removes your mounts from mountinfo for non-su processes; try_umount included.</span></dd></div>
+      <div><dt>sus_kstat</dt><dd><span lang="ru">Подменяет inode и время в stat(), statx() и maps.</span><span lang="en">Spoofs inode and timestamps in stat(), statx() and maps.</span></dd></div>
+      <div><dt>sus_map</dt><dd><span lang="ru">Прячет отображённый файл в maps, smaps, map_files и pagemap.</span><span lang="en">Hides the mapped file in maps, smaps, map_files and pagemap.</span></dd></div>
+      <div><dt>open_redirect</dt><dd><span lang="ru">Перенаправляет open() одного файла на другой.</span><span lang="en">Redirects open() of one file to another.</span></dd></div>
+      <div><dt>uname / cmdline</dt><dd><span lang="ru">Подменяет uname и cmdline / bootconfig.</span><span lang="en">Spoofs uname and cmdline / bootconfig.</span></dd></div>
+      <div><dt>avc_spoof</dt><dd><span lang="ru">Чистит следы KernelSU в аудит-логе SELinux (AVC).</span><span lang="en">Hides KernelSU traces in the SELinux AVC audit log.</span></dd></div>
+      <div><dt>hide_modules</dt><dd><span lang="ru">Убирает выбранные модули из /proc/modules, включая сам susfs.</span><span lang="en">Drops chosen modules, susfs itself included, from /proc/modules.</span></dd></div>
+      <div><dt>priority filter<span class="new">2.4.0</span></dt><dd><span lang="ru">Скрывает выбранные UID приложений от getpriority, setpriority, ioprio_get и ioprio_set для недоверенных процессов (uid ≥ 10000).</span><span lang="en">Hides selected app UIDs from getpriority, setpriority, ioprio_get and ioprio_set for untrusted processes (uid ≥ 10000).</span></dd></div>
+      <div><dt>sus_path UID filter<span class="new">2.4.0</span></dt><dd><span lang="ru">Команда SUSFS 2.4.0 для привязки правил sus_path к UID приложений.</span><span lang="en">SUSFS 2.4.0 command that ties sus_path rules to app UIDs.</span></dd></div>
+    </dl>
+  </div>
+</section>
+
+<section id="install">
+  <div class="wrap">
+    <h2><span lang="ru">Установка</span><span lang="en">Install</span></h2>
+    <p class="sub"><span lang="ru">Выберите способ. Для большинства устройств с KernelSU подходит ZIP-модуль.</span><span lang="en">Pick a method. For most KernelSU devices the ZIP module is the way to go.</span></p>
+    <div class="tabs">
+      <div role="tablist" aria-label="Install method">
+        <button role="tab" id="t1" aria-controls="p1" aria-selected="true">ZIP KernelSU</button>
+        <button role="tab" id="t2" aria-controls="p2" aria-selected="false" tabindex="-1"><span lang="ru">Менеджер LKM</span><span lang="en">LKM manager</span></button>
+        <button role="tab" id="t3" aria-controls="p3" aria-selected="false" tabindex="-1"><span lang="ru">Вручную</span><span lang="en">Manual</span></button>
+      </div>
+
+      <div role="tabpanel" id="p1" aria-labelledby="t1">
+        <ol class="steps">
+          <li><span lang="ru">Скачайте <code>SusFS-LKM-by-uran-&lt;версия&gt;.zip</code> из Releases.</span><span lang="en">Download <code>SusFS-LKM-by-uran-&lt;version&gt;.zip</code> from Releases.</span></li>
+          <li><span lang="ru">Прошейте его в менеджере KernelSU и перезагрузитесь.</span><span lang="en">Flash it in the KernelSU manager and reboot.</span></li>
+        </ol>
+        <p><span lang="ru">Модуль сам выбирает <code>.ko</code> по <code>/proc/sys/kernel/osrelease</code> и грузит его с <code>expose_proc=1</code>, поэтому появляются узлы <code>/proc/susfs_*</code>. Если SUSFS уже есть в системе, загрузка пропускается. В безопасном режиме модуль тоже ничего не грузит.</span><span lang="en">The module picks the <code>.ko</code> from <code>/proc/sys/kernel/osrelease</code> and loads it with <code>expose_proc=1</code>, so the <code>/proc/susfs_*</code> nodes appear. If SUSFS is already present, loading is skipped. Safe mode skips it too.</span></p>
+        <p class="callout"><span lang="ru">Ранняя загрузка (<code>post-fs-data.d</code>) включена по умолчанию. Чтобы выключить, создайте файл и перезагрузитесь:</span><span lang="en">Early loading (<code>post-fs-data.d</code>) is on by default. To turn it off, create this file and reboot:</span></p>
+        <div class="codebox"><pre>touch /data/adb/modules/susfs_guard_lkm/no_early_load</pre><button class="copy" type="button"><span lang="ru">Копировать</span><span lang="en">Copy</span></button></div>
+        <p><span lang="ru">Нужный KMI можно задать вручную: впишите его в файл <code>kmi_override</code> внутри модуля, например <code>android14-6.1</code>.</span><span lang="en">To force a KMI, write it into the <code>kmi_override</code> file inside the module, for example <code>android14-6.1</code>.</span></p>
+        <p><span lang="ru">Удаление: отключите или удалите модуль и перезагрузитесь, либо выгрузите на лету:</span><span lang="en">Removal: disable or remove the module and reboot, or unload it live:</span></p>
+        <div class="codebox"><pre>rmmod susfs_guard_lkm</pre><button class="copy" type="button"><span lang="ru">Копировать</span><span lang="en">Copy</span></button></div>
+      </div>
+
+      <div role="tabpanel" id="p2" aria-labelledby="t2" hidden>
+        <ol class="steps">
+          <li><span lang="ru">Скачайте <code>SusFS-LKM-by-uran-&lt;версия&gt;-&lt;kmi&gt;.ko</code> для вашего ядра.</span><span lang="en">Download <code>SusFS-LKM-by-uran-&lt;version&gt;-&lt;kmi&gt;.ko</code> for your kernel.</span></li>
+          <li><span lang="ru">Загрузите файл в менеджере LKM (например, FinaSU).</span><span lang="en">Load the file in your LKM manager (FinaSU, for example).</span></li>
+          <li><span lang="ru">В карточке модуля должно быть «SusFS LKM by uran», версия и автор <code>uran</code>.</span><span lang="en">The module card should read “SusFS LKM by uran”, the version and author <code>uran</code>.</span></li>
+        </ol>
+        <p><span lang="ru">Версия у релиза вида <code>v2.4.0-r1</code>, у сборки из CI вида <code>v2.4.0-r1-&lt;хэш&gt;</code>.</span><span lang="en">A release is versioned <code>v2.4.0-r1</code>, a CI build <code>v2.4.0-r1-&lt;hash&gt;</code>.</span></p>
+      </div>
+
+      <div role="tabpanel" id="p3" aria-labelledby="t3" hidden>
+        <p><span lang="ru">Подходит, если нет ни ZIP-модуля, ни менеджера. Положите <code>.ko</code> на устройство и загрузите от root.</span><span lang="en">Use this when you have neither the ZIP module nor a manager. Put the <code>.ko</code> on the device and load it as root.</span></p>
+        <p><span lang="ru">С KernelSU:</span><span lang="en">With KernelSU:</span></p>
+        <div class="codebox"><pre>ksud insmod /data/adb/loader/susfs_guard_lkm.ko</pre><button class="copy" type="button"><span lang="ru">Копировать</span><span lang="en">Copy</span></button></div>
+        <p><span lang="ru">Без KernelSU, загрузчиком <code>susfs_insmod</code> (лежит в ZIP, в <code>bin/</code>):</span><span lang="en">Without KernelSU, using the <code>susfs_insmod</code> loader (inside the ZIP, in <code>bin/</code>):</span></p>
+        <div class="codebox"><pre>susfs_insmod /data/adb/loader/susfs_guard_lkm.ko expose_proc=1</pre><button class="copy" type="button"><span lang="ru">Копировать</span><span lang="en">Copy</span></button></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="kmi">
+  <div class="wrap">
+    <h2>KMI</h2>
+    <p class="sub"><span lang="ru">KMI можно прочитать из версии ядра: у <code>6.1.75-android14-11</code> это <code>android14-6.1</code>. Узнать версию: <code>cat /proc/sys/kernel/osrelease</code>.</span><span lang="en">You can read the KMI off the kernel version: <code>6.1.75-android14-11</code> is <code>android14-6.1</code>. Check it with <code>cat /proc/sys/kernel/osrelease</code>.</span></p>
+    <div class="tw">
+      <table>
+        <thead><tr><th>KMI</th><th>Android</th><th><span lang="ru">Ядро</span><span lang="en">Kernel</span></th><th><span lang="ru">Файл в релизе</span><span lang="en">Release file</span></th></tr></thead>
+        <tbody>
+          <tr><td><code>android12-5.10</code></td><td>12</td><td>5.10</td><td><code>…-android12-5.10.ko</code></td></tr>
+          <tr><td><code>android13-5.10</code></td><td>13</td><td>5.10</td><td><code>…-android13-5.10.ko</code></td></tr>
+          <tr><td><code>android13-5.15</code></td><td>13</td><td>5.15</td><td><code>…-android13-5.15.ko</code></td></tr>
+          <tr><td><code>android14-5.15</code></td><td>14</td><td>5.15</td><td><code>…-android14-5.15.ko</code></td></tr>
+          <tr><td><code>android14-6.1</code></td><td>14</td><td>6.1</td><td><code>…-android14-6.1.ko</code> <span lang="ru">(настроено под OnePlus Ace 5)</span><span lang="en">(tuned for OnePlus Ace 5)</span></td></tr>
+          <tr><td><code>android15-6.6</code></td><td>15</td><td>6.6</td><td><code>…-android15-6.6.ko</code></td></tr>
+          <tr><td><code>android16-6.12</code></td><td>16</td><td>6.12</td><td><code>…-android16-6.12.ko</code></td></tr>
+          <tr><td><code>android17-6.18</code></td><td>17</td><td>6.18</td><td><code>…-android17-6.18.ko</code></td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<section id="proc">
+  <div class="wrap">
+    <h2><span lang="ru">Узлы /proc</span><span lang="en">/proc nodes</span></h2>
+    <p class="sub"><span lang="ru">Правила задаются записью в узлы. Они есть, если модуль загружен с <code>expose_proc=1</code>. Прочитать список правил можно через <code>cat</code>.</span><span lang="en">Rules are set by writing to these nodes. They exist when the module is loaded with <code>expose_proc=1</code>. Read the current rules with <code>cat</code>.</span></p>
+    <div class="tw">
+      <table>
+        <thead><tr><th><span lang="ru">Узел</span><span lang="en">Node</span></th><th><span lang="ru">Назначение</span><span lang="en">Purpose</span></th></tr></thead>
+        <tbody>
+          <tr><td><code>/proc/susfs_path</code></td><td><span lang="ru">Правила sus_path, <code>cat</code> показывает список.</span><span lang="en">sus_path rules; <code>cat</code> shows the list.</span></td></tr>
+          <tr><td><code>/proc/susfs_kstat</code></td><td><span lang="ru">Подмена stat / statx / maps.</span><span lang="en">stat / statx / maps spoofing.</span></td></tr>
+          <tr><td><code>/proc/susfs_map</code></td><td><span lang="ru">Скрытие отображённых файлов по inode.</span><span lang="en">Hides mapped files by inode.</span></td></tr>
+          <tr><td><code>/proc/susfs_hide_mounts</code></td><td><span lang="ru">Какие маунты считаются «вашими» и скрываются.</span><span lang="en">Which mounts count as yours and get hidden.</span></td></tr>
+          <tr><td><code>/proc/susfs_hide_modules</code></td><td><span lang="ru">Скрытие модулей ядра в /proc/modules.</span><span lang="en">Hides kernel modules in /proc/modules.</span></td></tr>
+          <tr><td><code>/proc/susfs_open_redirect</code></td><td><span lang="ru">Перенаправление open().</span><span lang="en">open() redirection.</span></td></tr>
+          <tr><td><code>/proc/susfs_opath</code></td><td><span lang="ru">Самопроверка покрытия open(O_PATH), только чтение.</span><span lang="en">Self-check of open(O_PATH) coverage, read-only.</span></td></tr>
+          <tr><td><code>/proc/susfs_enable_log</code></td><td><span lang="ru">Лог модуля: <code>0</code> или <code>1</code>.</span><span lang="en">Module log switch: <code>0</code> or <code>1</code>.</span></td></tr>
+          <tr><td><code>/proc/susfs_avc_spoof</code></td><td><span lang="ru">Подмена AVC-лога: <code>0</code> или <code>1</code>.</span><span lang="en">AVC log spoofing: <code>0</code> or <code>1</code>.</span></td></tr>
+          <tr><td><code>/proc/susfs_priority</code></td><td><span lang="ru">Фильтр UID для getpriority / ioprio (2.4.0).</span><span lang="en">UID filter for getpriority / ioprio (2.4.0).</span></td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="callout" style="margin-top:20px"><span lang="ru">Подробные команды каждого узла описаны в <a href="https://github.com/inforcqb/susfs4ksu-lkm/blob/main/PROC_INTERFACES.md" rel="noopener">PROC_INTERFACES</a> оригинального проекта. В этом форке часть узлов может отличаться.</span><span lang="en">Per-node commands are documented in the original project's <a href="https://github.com/inforcqb/susfs4ksu-lkm/blob/main/PROC_INTERFACES.en.md" rel="noopener">PROC_INTERFACES</a>. Some nodes may differ in this fork.</span></p>
+  </div>
+</section>
+
+<section id="build">
+  <div class="wrap">
+    <h2><span lang="ru">Сборка в GitHub Actions</span><span lang="en">Build with GitHub Actions</span></h2>
+    <p class="sub"><span lang="ru">Локальное ядро не нужно: всё собирается в контейнерах DDK. Запуск работает и с телефона.</span><span lang="en">No local kernel needed: everything builds in DDK containers. You can start it from a phone too.</span></p>
+    <ol class="steps">
+      <li><span lang="ru">Репозиторий → <strong>Actions</strong> → <strong>Build SusFS LKM by uran</strong> → <strong>Run workflow</strong>.</span><span lang="en">Repository → <strong>Actions</strong> → <strong>Build SusFS LKM by uran</strong> → <strong>Run workflow</strong>.</span></li>
+      <li><code>kernel</code>: <span lang="ru"><code>universal</code> (все 8 KMI и ZIP) или один KMI.</span><span lang="en"><code>universal</code> (all 8 KMIs and the ZIP) or a single KMI.</span></li>
+      <li><code>publish_release</code>: <span lang="ru">создать GitHub Release с ZIP и всеми <code>.ko</code>.</span><span lang="en">create a GitHub Release with the ZIP and all <code>.ko</code> files.</span></li>
+      <li><code>release_tag</code>: <span lang="ru">свой тег, например <code>v2.4.0-r2</code> или <code>r2</code>. Пусто, и номер <code>-rN</code> вырастет сам.</span><span lang="en">custom tag, for example <code>v2.4.0-r2</code> or <code>r2</code>. Leave empty and <code>-rN</code> increments by itself.</span></li>
+    </ol>
+  </div>
+</section>
+
+<section id="faq">
+  <div class="wrap">
+    <h2>FAQ</h2>
+    <details><summary><span lang="ru">Нужно ли пересобирать ядро?</span><span lang="en">Do I need to rebuild the kernel?</span></summary><p><span lang="ru">Нет. Это отдельный <code>.ko</code>, берите тот, что совпадает с KMI вашего устройства.</span><span lang="en">No. It is a standalone <code>.ko</code>; take the one that matches your device's KMI.</span></p></details>
+    <details><summary><span lang="ru">Как понять, какой у меня KMI?</span><span lang="en">How do I find my KMI?</span></summary><p><span lang="ru">Выполните <code>cat /proc/sys/kernel/osrelease</code>. Строка <code>6.6.30-android15-…</code> означает <code>android15-6.6</code>. ZIP-модуль определяет KMI сам.</span><span lang="en">Run <code>cat /proc/sys/kernel/osrelease</code>. A string like <code>6.6.30-android15-…</code> means <code>android15-6.6</code>. The ZIP module detects it for you.</span></p></details>
+    <details><summary><span lang="ru">Работает без KernelSU?</span><span lang="en">Does it work without KernelSU?</span></summary><p><span lang="ru">Да, через загрузчик <code>susfs_insmod</code> из ZIP. Нужен root, arm64 и подходящее GKI-ядро.</span><span lang="en">Yes, with the <code>susfs_insmod</code> loader from the ZIP. You need root, arm64 and a matching GKI kernel.</span></p></details>
+    <details><summary><span lang="ru">После прошивки нет /proc/susfs_*</span><span lang="en">/proc/susfs_* is missing after flashing</span></summary><p><span lang="ru">Проверьте, что модуль загрузился: <code>lsmod | grep susfs</code>, и посмотрите <code>load.log</code> в папке модуля. Узлы создаются только при <code>expose_proc=1</code>. Если в ядре уже есть SUSFS, модуль не грузится.</span><span lang="en">Check that the module loaded: <code>lsmod | grep susfs</code>, and read <code>load.log</code> in the module folder. The nodes are created only with <code>expose_proc=1</code>. If the kernel already has SUSFS, the module does not load.</span></p></details>
+    <details><summary><span lang="ru">Трогает ли это раздел ядра?</span><span lang="en">Does it touch the kernel partition?</span></summary><p><span lang="ru">Нет. Модуль работает только в памяти. Отключите его, перезагрузитесь, и система чистая.</span><span lang="en">No. The module lives in memory only. Disable it, reboot, and the system is clean.</span></p></details>
+  </div>
+</section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <ul class="credits">
+      <li><span lang="ru">Форк и сборки:</span><span lang="en">Fork and builds:</span> uran</li>
+      <li><span lang="ru">Основа:</span><span lang="en">Based on:</span> <a href="https://github.com/inforcqb/susfs4ksu-lkm" rel="noopener">inforcqb/susfs4ksu-lkm</a></li>
+      <li><a href="https://gitlab.com/simonpunk/susfs4ksu" rel="noopener">susfs4ksu</a> (simonpunk)</li>
+      <li><a href="https://github.com/SukiSU-Ultra/SukiSU-Ultra" rel="noopener">SukiSU-Ultra</a></li>
+      <li><a href="https://github.com/Dere3046/KallRecon" rel="noopener">KallRecon</a></li>
+      <li><a href="https://github.com/Dere3046/HooKern" rel="noopener">HooKern</a></li>
+    </ul>
+    <p style="margin-top:20px"><span lang="ru">Лицензия GPL-2.0. Только для исследований и обучения. Модули ядра могут сломать загрузку: делайте бэкап и пользуйтесь на свой риск.</span><span lang="en">GPL-2.0 licensed. For research and study only. Kernel modules can break booting: back up first and use at your own risk.</span></p>
+  </div>
+</footer>
+
+<script src="site.js"></script>
+</body>
+</html>
